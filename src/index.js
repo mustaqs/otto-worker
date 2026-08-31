@@ -14,6 +14,13 @@
 
 const ANTHROPIC = "https://api.anthropic.com/v1/messages";
 
+/**
+ * Set the first time this isolate handles a request. Workers spin down when
+ * idle, and a cold start is indistinguishable from Anthropic being slow when
+ * measured from the app. This is how they are told apart.
+ */
+let isolateWarm = false;
+
 /** Models Otto is allowed to ask for. A leaked token cannot pick another. */
 const ALLOWED_MODELS = new Set([
   "claude-opus-5",
@@ -23,6 +30,10 @@ const ALLOWED_MODELS = new Set([
 
 export default {
   async fetch(request, env, ctx) {
+    const t0 = Date.now();
+    const cold = !isolateWarm;
+    isolateWarm = true;
+
     if (request.method !== "POST") return problem(405, "method_not_allowed");
     const url = new URL(request.url);
     if (url.pathname !== "/v1/ask") return problem(404, "not_found");
@@ -38,6 +49,7 @@ export default {
     // cost rather than handing out a free retry.
     const limit = await countAndCheck(env, token, account);
     if (limit) return limit;
+    const afterKV = Date.now();
 
     let body;
     try {
@@ -49,6 +61,7 @@ export default {
     const rejection = validate(body, env);
     if (rejection) return rejection;
 
+    const beforeUpstream = Date.now();
     const upstream = await fetch(ANTHROPIC, {
       method: "POST",
       headers: {
@@ -80,12 +93,30 @@ export default {
      * becomes a 5s wait if the answer is assembled here first, and speech
      * cannot start early.
      */
+    /*
+     * `await fetch` resolves when Anthropic's response HEADERS arrive, so this
+     * measures Anthropic's time to first byte and nothing of the relay. The
+     * difference between it and `total` is what the relay itself costs — the
+     * number that decides whether the relay is worth attacking.
+     *
+     * Timing only. No request or response content is measured, counted, or
+     * described, and this adds no read of either body.
+     */
+    const upstreamMs = Date.now() - beforeUpstream;
+    const total = Date.now() - t0;
+
     return new Response(upstream.body, {
       status: 200,
       headers: {
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache, no-store",
         "connection": "keep-alive",
+        "server-timing": [
+          `cold;dur=${cold ? 1 : 0}`,
+          `auth;dur=${afterKV - t0}`,
+          `upstream;dur=${upstreamMs}`,
+          `relay;dur=${total - upstreamMs}`,
+        ].join(", "),
       },
     });
   },

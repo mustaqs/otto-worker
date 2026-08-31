@@ -94,6 +94,11 @@ console.log("streaming (the one that matters):");
   check("no Content-Length (which would force buffering)",
         response.headers.get("content-length") === null);
 
+  const timing = response.headers.get("server-timing") || "";
+  check("reports its own overhead, so relay cost is separable from Anthropic's",
+        /cold;dur=[01]/.test(timing) && /upstream;dur=\d+/.test(timing) && /relay;dur=\d+/.test(timing),
+        timing);
+
   releaseSecondChunk();
   const second = await reader.read();
   check("the rest of the stream still arrives",
