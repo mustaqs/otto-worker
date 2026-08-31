@@ -9,7 +9,7 @@ compatibility_date = "2026-08-01"
 
 [[kv_namespaces]]
 binding = "OTTO"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "a8141d2bc3cf455fa4a25d20014e2832""
 
 [observability]
 enabled = false
