@@ -1,6 +1,7 @@
 name = "otto-worker"
 main = "src/index.js"
 compatibility_date = "2026-08-01"
+preview_urls = false
 
 # NO SECRETS IN THIS FILE, ever. The Anthropic key is set out of band:
 #   wrangler secret put ANTHROPIC_API_KEY
@@ -13,7 +14,7 @@ id = "a8141d2bc3cf455fa4a25d20014e2832"
 
 [observability]
 enabled = false
-preview_urls = false
+
 [vars]
 # Bounds what a leaked token can do. See README: a token is not a general
 # purpose Anthropic proxy.
