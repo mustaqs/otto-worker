@@ -1,0 +1,22 @@
+name = "otto-worker"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# NO SECRETS IN THIS FILE, ever. The Anthropic key is set out of band:
+#   wrangler secret put ANTHROPIC_API_KEY
+# It exists only in Cloudflare's environment and never in the repository —
+# which is what makes publishing this source safe.
+
+[[kv_namespaces]]
+binding = "OTTO"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[observability]
+enabled = false
+
+[vars]
+# Bounds what a leaked token can do. See README: a token is not a general
+# purpose Anthropic proxy.
+MAX_BODY_BYTES = "6000000"
+MAX_OUTPUT_TOKENS = "4096"
+MAX_IMAGES = "2"

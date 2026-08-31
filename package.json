@@ -1,0 +1,9 @@
+{
+  "name": "otto-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs",
+    "deploy": "node test.mjs && wrangler deploy"
+  }
+}
