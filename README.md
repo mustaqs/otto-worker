@@ -51,6 +51,10 @@ error body, or KV. The only things written are per-user counters.
     wrangler kv namespace create OTTO        # put the id in wrangler.toml
     wrangler secret put ANTHROPIC_API_KEY
 
+`preview_urls` stays **false**. With it on, every deployed version gets its own
+public URL — extra internet-facing surface on a Worker that holds a production
+API key, for no benefit here. One address, one thing to reason about.
+
 ## Issuing a token
 
 Token records are **versioned from the first day**, because retrofitting a
@@ -58,12 +62,22 @@ schema version onto records already in production means guessing at record
 shape. A later version adding `plan`, `expiresAt` or `customerId` is then a
 migration rather than archaeology.
 
-    wrangler kv key put --binding=OTTO "token:beta-alice-7f3a" \
+    wrangler kv key put --remote --binding=OTTO "token:beta-alice-7f3a" \
       '{"v":1,"name":"alice","active":true,"dailyCap":200,"hourlyCap":40}'
 
-Revoke:
+**`--remote` is not optional, and leaving it off fails in the worst way.**
+Without it wrangler writes to the local preview namespace, which the deployed
+Worker cannot read — and `wrangler kv key get` reads that *same* local store, so
+it cheerfully confirms a key that is not where it needs to be. The check agrees
+with you while the Worker rejects the token, and the symptom looks like a bad
+token rather than a key in the wrong namespace. Use `--remote` on every read and
+write meant for production:
 
-    wrangler kv key put --binding=OTTO "token:beta-alice-7f3a" \
+    wrangler kv key get --remote --binding=OTTO "token:beta-alice-7f3a"
+
+Revoke — also `--remote`:
+
+    wrangler kv key put --remote --binding=OTTO "token:beta-alice-7f3a" \
       '{"v":1,"name":"alice","active":false,"dailyCap":200,"hourlyCap":40}'
 
 ## Tests

@@ -1,6 +1,10 @@
 name = "otto-worker"
 main = "src/index.js"
 compatibility_date = "2026-08-01"
+
+# Off deliberately: with preview URLs on, every deployed version gets its own
+# public address. That is extra internet-facing surface on a Worker holding a
+# production API key, for no benefit.
 preview_urls = false
 
 # NO SECRETS IN THIS FILE, ever. The Anthropic key is set out of band:
