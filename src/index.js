@@ -53,10 +53,25 @@ export default {
     if (!account) return problem(401, "unknown_token");
     if (!account.active) return problem(403, "revoked");
 
-    // Counted BEFORE the upstream call, so a failure downstream fails closed on
-    // cost rather than handing out a free retry.
-    const limit = await countAndCheck(env, token, account, timing);
-    if (limit) return limit;
+    // Checked before the upstream call, so a failure downstream still counts and
+    // does not hand out a free retry. The INCREMENT is deferred — see below.
+    const gate = await checkLimits(env, token, account, timing);
+    if (gate.refused) return gate.refused;
+
+    /*
+     * The counter write costs ~290ms and is deliberately OFF the critical path.
+     *
+     * Measured: kvwrite was a stable ~290ms of a ~600ms auth phase, while reads
+     * ranged 4-158ms depending on edge cache warmth. Nothing downstream depends
+     * on the write having landed, so waiting for it spent a third of a second
+     * on every question to make a counter durable a moment sooner.
+     *
+     * Scheduled here rather than after the upstream call, so a request that
+     * fails at Anthropic still counts. What is given up: a write that fails is
+     * lost, and repeated failures would accrue free requests. That is a
+     * deliberate reliability trade, so it is logged rather than swallowed.
+     */
+    defer(ctx, gate.commit(), "counter increment");
     const afterKV = Date.now();
 
     let body;
@@ -180,7 +195,12 @@ async function loadAccount(env, token) {
  * their cap. That is a cent, and it is the right trade for not needing a
  * strongly consistent store on the hot path.
  */
-async function countAndCheck(env, token, account, timing = {}) {
+/**
+ * Reads the counters and decides. Returns either a refusal or a `commit` that
+ * performs the increment — separated so the caller can schedule the write
+ * instead of awaiting it.
+ */
+async function checkLimits(env, token, account, timing = {}) {
   const now = new Date();
   const day = now.toISOString().slice(0, 10);          // YYYY-MM-DD
   const hour = now.toISOString().slice(0, 13);         // YYYY-MM-DDTHH
@@ -200,19 +220,21 @@ async function countAndCheck(env, token, account, timing = {}) {
   // The hourly limit is the real protection against a runaway bill: a daily cap
   // can still be burned through in a minute by a loop.
   if (account.hourlyCap > 0 && hourCount >= account.hourlyCap) {
-    return problem(429, "hourly_limit", { retryAfter: secondsToNextHour(now) });
+    return { refused: problem(429, "hourly_limit", { retryAfter: secondsToNextHour(now) }) };
   }
   if (account.dailyCap > 0 && dayCount >= account.dailyCap) {
-    return problem(429, "daily_limit", { retryAfter: secondsToNextDay(now) });
+    return { refused: problem(429, "daily_limit", { retryAfter: secondsToNextDay(now) }) };
   }
 
-  const tWrite = Date.now();
-  await Promise.all([
-    env.OTTO.put(dayKey, String(dayCount + 1), { expirationTtl: 60 * 60 * 48 }),
-    env.OTTO.put(hourKey, String(hourCount + 1), { expirationTtl: 60 * 60 * 2 }),
-  ]);
-  timing.counterWrite = Date.now() - tWrite;
-  return null;
+  timing.counterWrite = 0;   // no longer on the critical path
+  return {
+    refused: null,
+    commit: () =>
+      Promise.all([
+        env.OTTO.put(dayKey, String(dayCount + 1), { expirationTtl: 60 * 60 * 48 }),
+        env.OTTO.put(hourKey, String(hourCount + 1), { expirationTtl: 60 * 60 * 2 }),
+      ]),
+  };
 }
 
 const secondsToNextHour = (now) => 3600 - (now.getUTCMinutes() * 60 + now.getUTCSeconds());
@@ -263,6 +285,23 @@ function problem(status, code, extra = {}) {
     status,
     headers: { "content-type": "application/json", "cache-control": "no-store" },
   });
+}
+
+/**
+ * Runs work after the response, and says so when it fails.
+ *
+ * Deferring the counter write makes it less reliable on purpose, so the failure
+ * must not be silent — a lost write is a free request, and at scale a pattern of
+ * them is the difference between a cap that holds and one that does not. The
+ * message carries no token and no request content: it says what failed, not for
+ * whom. Visible with `wrangler tail`; observability stays off.
+ */
+function defer(ctx, work, what) {
+  const reported = Promise.resolve(work).catch((error) => {
+    console.error(`deferred ${what} failed: ${error && error.message ? error.message : error}`);
+  });
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(reported);
+  return reported;
 }
 
 function bearer(request) {

@@ -34,6 +34,21 @@ const env = (kv) => ({
   MAX_IMAGES: "2",
 });
 
+// Stands in for the Workers runtime's ctx. Deferred work is collected so a test
+// can await what production would run after the response.
+const makeCtx = () => {
+  const pending = [];
+  return { waitUntil: (p) => pending.push(p), settle: () => Promise.all(pending) };
+};
+
+/** Sends, then lets the deferred counter write land, as the runtime would. */
+const send = async (envObj, body = valid, token = goodToken) => {
+  const ctx = makeCtx();
+  const response = await worker.fetch(ask(body, token), envObj, ctx);
+  await ctx.settle();
+  return response;
+};
+
 const ask = (body, token = goodToken) =>
   new Request("https://w/v1/ask", {
     method: "POST",
@@ -130,9 +145,9 @@ globalThis.fetch = async () => new Response(new ReadableStream({ start: (c) => c
 console.log("limits:");
 {
   const kv = makeKV({ [`token:${goodToken}`]: account({ hourlyCap: 2, dailyCap: 100 }) });
-  const first = await worker.fetch(ask(valid), env(kv));
-  const second = await worker.fetch(ask(valid), env(kv));
-  const third = await worker.fetch(ask(valid), env(kv));
+  const first = await send(env(kv));
+  const second = await send(env(kv));
+  const third = await send(env(kv));
   check("under the hourly cap passes", first.status === 200 && second.status === 200);
   check("over the hourly cap is refused", third.status === 429);
   const body = await third.json();
@@ -140,14 +155,14 @@ console.log("limits:");
         body.error === "hourly_limit" && typeof body.retryAfter === "number");
 
   const daily = makeKV({ [`token:${goodToken}`]: account({ hourlyCap: 0, dailyCap: 1 }) });
-  await worker.fetch(ask(valid), env(daily));
+  await send(env(daily));
   check("daily cap is enforced separately",
-        (await worker.fetch(ask(valid), env(daily))).status === 429);
+        (await send(env(daily))).status === 429);
 
   // Counted before the upstream call: a failure downstream must not be free.
   const counted = makeKV({ [`token:${goodToken}`]: account() });
   globalThis.fetch = async () => new Response("nope", { status: 500 });
-  await worker.fetch(ask(valid), env(counted));
+  await send(env(counted));
   const day = new Date().toISOString().slice(0, 10);
   check("a failed upstream call still counts against the cap",
         counted.store.get(`u:${goodToken}:d:${day}`) === "1");
@@ -155,6 +170,40 @@ console.log("limits:");
 }
 
 // ------------------------------------------------------------- validation
+
+console.log("deferring the counter write:");
+{
+  const kv = makeKV({ [`token:${goodToken}`]: account() });
+  // A KV whose writes are slow. If the response waits on them, this shows up.
+  const slow = { ...kv, put: async (k, v) => { await new Promise((r) => setTimeout(r, 300)); return kv.put(k, v); } };
+  const ctx = makeCtx();
+  const started = Date.now();
+  const response = await worker.fetch(ask(valid), { ...env(kv), OTTO: slow }, ctx);
+  const elapsed = Date.now() - started;
+  check("the response does not wait for the counter write", elapsed < 200, `${elapsed}ms`);
+  check("timing reports the write as off the critical path",
+        /kvwrite;dur=0/.test(response.headers.get("server-timing") || ""));
+  await ctx.settle();
+  const day = new Date().toISOString().slice(0, 10);
+  check("and the write still lands once the runtime runs it",
+        kv.store.get(`u:${goodToken}:d:${day}`) === "1");
+}
+{
+  // A lost write is a free request, so it must not be silent.
+  const kv = makeKV({ [`token:${goodToken}`]: account() });
+  const broken = { ...kv, put: async () => { throw new Error("kv unavailable"); } };
+  const ctx = makeCtx();
+  const errors = [];
+  const realError = console.error;
+  console.error = (m) => errors.push(String(m));
+  await worker.fetch(ask(valid), { ...env(kv), OTTO: broken }, ctx);
+  await ctx.settle();
+  console.error = realError;
+  check("a lost counter write is logged rather than swallowed",
+        errors.some((e) => e.includes("deferred counter increment failed")), errors.join("|"));
+  check("and the report names no token and no request content",
+        !errors.join("|").includes(goodToken));
+}
 
 console.log("a leaked token is not a general Anthropic proxy:");
 {
@@ -184,8 +233,8 @@ console.log("nothing about a request is retained:");
 {
   const kv = makeKV({ [`token:${goodToken}`]: account() });
   const secret = "a-screenshot-would-be-here";
-  await worker.fetch(ask({ ...valid,
-    messages: [{ role: "user", content: [{ type: "text", text: secret }] }] }), env(kv));
+  await send(env(kv), { ...valid,
+    messages: [{ role: "user", content: [{ type: "text", text: secret }] }] });
   const stored = [...kv.store.entries()].map(([k, v]) => k + "=" + v).join("\n");
   check("no request content in anything written to KV", !stored.includes(secret));
   check("only counters and the token record were written",
