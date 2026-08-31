@@ -41,13 +41,21 @@ export default {
     const token = bearer(request);
     if (!token) return problem(401, "missing_token");
 
+    // Broken into parts because "auth costs 600ms" is not actionable: a token
+    // read, two counter reads and two counter writes are three round trips with
+    // very different costs, and optimising the wrong one is how A20 went.
+    const timing = { tokenRead: 0, counterRead: 0, counterWrite: 0 };
+
+    const tToken = Date.now();
     const account = await loadAccount(env, token);
+    timing.tokenRead = Date.now() - tToken;
+
     if (!account) return problem(401, "unknown_token");
     if (!account.active) return problem(403, "revoked");
 
     // Counted BEFORE the upstream call, so a failure downstream fails closed on
     // cost rather than handing out a free retry.
-    const limit = await countAndCheck(env, token, account);
+    const limit = await countAndCheck(env, token, account, timing);
     if (limit) return limit;
     const afterKV = Date.now();
 
@@ -114,6 +122,9 @@ export default {
         "server-timing": [
           `cold;dur=${cold ? 1 : 0}`,
           `auth;dur=${afterKV - t0}`,
+          `kvtoken;dur=${timing.tokenRead}`,
+          `kvread;dur=${timing.counterRead}`,
+          `kvwrite;dur=${timing.counterWrite}`,
           `upstream;dur=${upstreamMs}`,
           `relay;dur=${total - upstreamMs}`,
         ].join(", "),
@@ -169,7 +180,7 @@ async function loadAccount(env, token) {
  * their cap. That is a cent, and it is the right trade for not needing a
  * strongly consistent store on the hot path.
  */
-async function countAndCheck(env, token, account) {
+async function countAndCheck(env, token, account, timing = {}) {
   const now = new Date();
   const day = now.toISOString().slice(0, 10);          // YYYY-MM-DD
   const hour = now.toISOString().slice(0, 13);         // YYYY-MM-DDTHH
@@ -177,10 +188,12 @@ async function countAndCheck(env, token, account) {
   const dayKey = `u:${token}:d:${day}`;
   const hourKey = `u:${token}:h:${hour}`;
 
+  const tRead = Date.now();
   const [dayRaw, hourRaw] = await Promise.all([
     env.OTTO.get(dayKey),
     env.OTTO.get(hourKey),
   ]);
+  timing.counterRead = Date.now() - tRead;
   const dayCount = Number(dayRaw) || 0;
   const hourCount = Number(hourRaw) || 0;
 
@@ -193,10 +206,12 @@ async function countAndCheck(env, token, account) {
     return problem(429, "daily_limit", { retryAfter: secondsToNextDay(now) });
   }
 
+  const tWrite = Date.now();
   await Promise.all([
     env.OTTO.put(dayKey, String(dayCount + 1), { expirationTtl: 60 * 60 * 48 }),
     env.OTTO.put(hourKey, String(hourCount + 1), { expirationTtl: 60 * 60 * 2 }),
   ]);
+  timing.counterWrite = Date.now() - tWrite;
   return null;
 }
 

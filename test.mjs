@@ -96,7 +96,8 @@ console.log("streaming (the one that matters):");
 
   const timing = response.headers.get("server-timing") || "";
   check("reports its own overhead, so relay cost is separable from Anthropic's",
-        /cold;dur=[01]/.test(timing) && /upstream;dur=\d+/.test(timing) && /relay;dur=\d+/.test(timing),
+        /cold;dur=[01]/.test(timing) && /upstream;dur=\d+/.test(timing) && /relay;dur=\d+/.test(timing)
+        && /kvtoken;dur=\d+/.test(timing) && /kvread;dur=\d+/.test(timing) && /kvwrite;dur=\d+/.test(timing),
         timing);
 
   releaseSecondChunk();
