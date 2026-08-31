@@ -9,7 +9,7 @@ compatibility_date = "2026-08-01"
 
 [[kv_namespaces]]
 binding = "OTTO"
-id = "a8141d2bc3cf455fa4a25d20014e2832""
+id = "a8141d2bc3cf455fa4a25d20014e2832"
 
 [observability]
 enabled = false
