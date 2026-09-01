@@ -63,6 +63,26 @@ hour. A display saying "today" would be wrong for a third of the day for anyone
 west of Greenwich; "resets in 6h" is true everywhere, and no timezone has to
 exist anywhere in the system.
 
+**Brace the variables in KV key commands.** The counter keys look like
+`u:<token>:h:<YYYY-MM-DDTHH>`, and in zsh — macOS's default shell — `:h` is a
+parameter expansion modifier meaning "head of path". So `"u:$TOKEN:h:$HOUR"`
+expands `$TOKEN:h` to `.` and the command **silently reads, writes or deletes the
+wrong key while appearing to succeed**. Always brace:
+
+    TOKEN=beta-abc
+    HOUR=$(date -u +%Y-%m-%dT%H)
+    wrangler kv key put --remote --binding=OTTO "u:${TOKEN}:h:${HOUR}" 999
+    wrangler kv key delete --remote --binding=OTTO "u:${TOKEN}:h:${HOUR}"
+
+The daily key `u:${TOKEN}:d:${DAY}` is safe by luck — `:d` is not a modifier —
+but brace it too rather than relying on which letters zsh happens to claim.
+
+**Changes to KV are not visible for up to a minute.** Reads are edge-cached with
+a `cacheTtl` default of 60 seconds, which is also the minimum settable value, so
+there is no way to opt out. After any `wrangler kv key put`, wait ~65 seconds
+before expecting the Worker to see it. The same applies to revoking a token or
+lowering a cap.
+
 The alternative was a `GET /v1/usage` endpoint the app would call when its
 settings panel opened. That would make network activity no longer 1:1 with a
 question the user asked — a new category of request, triggered by a UI gesture,
