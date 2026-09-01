@@ -169,6 +169,53 @@ console.log("limits:");
   globalThis.fetch = async () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
 }
 
+// ------------------------------------------------------------------- usage
+
+console.log("usage reported back to the person it is about:");
+{
+  const parse = (response) => {
+    const raw = response.headers.get("otto-usage") || "";
+    return Object.fromEntries(raw.split(";").filter(Boolean).map((p) => {
+      const [k, v] = p.split("=");
+      return [k, Number(v)];
+    }));
+  };
+
+  const kv = makeKV({ [`token:${goodToken}`]: account({ dailyCap: 50, hourlyCap: 10 }) });
+  const first = parse(await send(env(kv)));
+  check("the first question reports itself as used, not as zero",
+        first.day === 1 && first.hour === 1, JSON.stringify(first));
+  check("caps come from the token record",
+        first["day-cap"] === 50 && first["hour-cap"] === 10, JSON.stringify(first));
+
+  // THE BUG THIS EXISTS TO CATCH. checkLimits reads the counters before the
+  // increment is scheduled, so reporting the raw read leaves the display one
+  // question behind forever — which looks like a broken panel, not a wrong
+  // number, and would be indistinguishable from the counter not working.
+  const second = parse(await send(env(kv)));
+  check("and the count advances with each question", second.day === 2, JSON.stringify(second));
+
+  check("reset seconds are bounded by the periods they reset",
+        first["day-resets"] > 0 && first["day-resets"] <= 86400 &&
+        first["hour-resets"] > 0 && first["hour-resets"] <= 3600,
+        JSON.stringify(first));
+
+  // A refusal is the moment a user most wants to see the bar full.
+  const capped = makeKV({ [`token:${goodToken}`]: account({ dailyCap: 1, hourlyCap: 0 }) });
+  await send(env(capped));
+  const refused = await send(env(capped));
+  const atCap = parse(refused);
+  check("a refusal carries the counts too", refused.status === 429 && atCap.day === 1,
+        JSON.stringify(atCap));
+  check("and reports the count at the cap rather than one past it",
+        atCap.day === atCap["day-cap"], JSON.stringify(atCap));
+
+  // Nothing about the question, only about the account.
+  const raw = refused.headers.get("otto-usage");
+  check("the header describes the account and never the request",
+        !/[a-zA-Z]{4,}/.test(raw.replace(/day|cap|hour|resets/g, "")), raw);
+}
+
 // ------------------------------------------------------------- validation
 
 console.log("deferring the counter write:");

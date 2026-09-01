@@ -128,9 +128,26 @@ export default {
     const upstreamMs = Date.now() - beforeUpstream;
     const total = Date.now() - t0;
 
+    /*
+     * `otto-usage` is a HEADER, and that is the whole design.
+     *
+     * The alternative was a GET /v1/usage endpoint Otto would call when the
+     * user opened the menu bar panel. That would make network activity no
+     * longer 1:1 with a question the user asked — a new category of request,
+     * triggered by a UI gesture, needing its own line in the privacy page.
+     * Here there is no new request, no new endpoint and no new state: every
+     * number was already read by checkLimits before the upstream call.
+     *
+     * It rides on the response head, which Workers emit as soon as the
+     * upstream headers arrive, so Otto has the numbers at time-to-first-token
+     * rather than at the end of the answer. And it touches nothing of the
+     * body, so it is not in the family of changes that breaks pass-through
+     * streaming — asserted by the streaming test rather than argued here.
+     */
     return new Response(upstream.body, {
       status: 200,
       headers: {
+        ...gate.usage,
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache, no-store",
         "connection": "keep-alive",
@@ -219,16 +236,50 @@ async function checkLimits(env, token, account, timing = {}) {
 
   // The hourly limit is the real protection against a runaway bill: a daily cap
   // can still be burned through in a minute by a loop.
+  /*
+   * What Otto shows the user about their own usage.
+   *
+   * COUNTED INCLUSIVE OF THIS REQUEST. `dayCount` is read before the increment
+   * and the increment is scheduled unconditionally below, so reporting the raw
+   * read would leave the display permanently one question behind and looking
+   * broken after the very first question. On a refusal the counts are already
+   * at the cap and are reported as they are.
+   *
+   * The reset seconds are here because the counters roll over at UTC midnight
+   * and UTC hour. A display saying "today" would be wrong for a third of the
+   * day for anyone west of Greenwich; "resets in 6h" is true everywhere and
+   * needs no timezone to exist anywhere in the system.
+   */
+  const usage = (inclusive) => ({
+    "otto-usage": [
+      `day=${dayCount + (inclusive ? 1 : 0)}`,
+      `day-cap=${account.dailyCap}`,
+      `hour=${hourCount + (inclusive ? 1 : 0)}`,
+      `hour-cap=${account.hourlyCap}`,
+      `day-resets=${secondsToNextDay(now)}`,
+      `hour-resets=${secondsToNextHour(now)}`,
+    ].join(";"),
+  });
+
+  // The refusal carries the counts too. It is the moment a user most wants to
+  // see the bar full, and it means Otto has one place that parses this.
   if (account.hourlyCap > 0 && hourCount >= account.hourlyCap) {
-    return { refused: problem(429, "hourly_limit", { retryAfter: secondsToNextHour(now) }) };
+    return {
+      refused: problem(429, "hourly_limit",
+                       { retryAfter: secondsToNextHour(now) }, usage(false)),
+    };
   }
   if (account.dailyCap > 0 && dayCount >= account.dailyCap) {
-    return { refused: problem(429, "daily_limit", { retryAfter: secondsToNextDay(now) }) };
+    return {
+      refused: problem(429, "daily_limit",
+                       { retryAfter: secondsToNextDay(now) }, usage(false)),
+    };
   }
 
   timing.counterWrite = 0;   // no longer on the critical path
   return {
     refused: null,
+    usage: usage(true),
     commit: () =>
       Promise.all([
         env.OTTO.put(dayKey, String(dayCount + 1), { expirationTtl: 60 * 60 * 48 }),
@@ -280,10 +331,14 @@ function validate(body, env) {
  * Errors carry a code and nothing else. No echo of the request, so a
  * screenshot cannot end up in an error body any more than it can in a log.
  */
-function problem(status, code, extra = {}) {
+function problem(status, code, extra = {}, headers = {}) {
   return new Response(JSON.stringify({ error: code, ...extra }), {
     status,
-    headers: { "content-type": "application/json", "cache-control": "no-store" },
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      ...headers,
+    },
   });
 }
 

@@ -44,6 +44,30 @@ record; the next request is refused. No redeploy, no effect on anyone else.
 **It retains nothing.** No request or response content is read into a log, an
 error body, or KV. The only things written are per-user counters.
 
+**It tells you your own usage, without a second request.** Every response —
+including a 429 refusal — carries an `otto-usage` header:
+
+    otto-usage: day=12;day-cap=50;hour=3;hour-cap=10;day-resets=21600;hour-resets=1180
+
+Every number was already read by `checkLimits` before the upstream call, so
+this adds no KV read, no endpoint and no state. It rides on the response head,
+which Workers emit as soon as the upstream headers arrive, so the app has the
+numbers at time-to-first-token rather than at the end of the answer.
+
+`day` and `hour` are **inclusive of the request being answered**. The counters
+are read before the increment is scheduled, so reporting the raw read would
+leave any display permanently one question behind.
+
+The reset seconds exist because the counters roll over at UTC midnight and UTC
+hour. A display saying "today" would be wrong for a third of the day for anyone
+west of Greenwich; "resets in 6h" is true everywhere, and no timezone has to
+exist anywhere in the system.
+
+The alternative was a `GET /v1/usage` endpoint the app would call when its
+settings panel opened. That would make network activity no longer 1:1 with a
+question the user asked — a new category of request, triggered by a UI gesture,
+needing its own line in the privacy page. This costs less and explains better.
+
 ## Setup
 
     npm i -g wrangler
