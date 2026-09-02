@@ -23,5 +23,11 @@ enabled = false
 # Bounds what a leaked token can do. See README: a token is not a general
 # purpose Anthropic proxy.
 MAX_BODY_BYTES = "6000000"
-MAX_OUTPUT_TOKENS = "4096"
+# Raised from 4096 for deep mode. Thinking counts against max_tokens on Opus,
+# so an effort:high request on a dense screen truncates at 4096 — and a
+# truncated deep answer reads as a worse answer rather than as a budget
+# problem. This is a bound on the worst case, not a target: the system prompt
+# still asks for a sentence or two, and the hourly request cap remains the
+# real protection against a runaway bill.
+MAX_OUTPUT_TOKENS = "16384"
 MAX_IMAGES = "2"
