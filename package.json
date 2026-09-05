@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "test": "node test.mjs",
-    "deploy": "node test.mjs && wrangler deploy"
+    "deploy": "node test.mjs && wrangler deploy",
+    "plans:apply": "node scripts/plans-apply.mjs",
+    "check": "./Bench/check-question-path.sh && ./Bench/check-plan-sync.sh"
   }
 }

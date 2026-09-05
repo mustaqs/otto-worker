@@ -36,6 +36,13 @@ export default {
 
     if (request.method !== "POST") return problem(405, "method_not_allowed");
     const url = new URL(request.url);
+
+    // Registration is a separate route on purpose, and it is the ONLY other one.
+    // Everything the question path needs is below; nothing it calls reaches D1
+    // or any identity provider. Bench/check-question-path.sh asserts that by
+    // grep rather than by reading, in the style of the app's check-monitors.sh.
+    if (url.pathname === "/v1/device") return registerDevice(request, env);
+
     if (url.pathname !== "/v1/ask") return problem(404, "not_found");
 
     const token = bearer(request);
@@ -55,7 +62,7 @@ export default {
 
     // Checked before the upstream call, so a failure downstream still counts and
     // does not hand out a free retry. The INCREMENT is deferred — see below.
-    const gate = await checkLimits(env, token, account, timing);
+    const gate = await checkLimits(env, account, timing);
     if (gate.refused) return gate.refused;
 
     /*
@@ -165,16 +172,131 @@ export default {
   },
 };
 
+// ------------------------------------------------------------ registration
+
+/**
+ * Mints a trial device token. Called once, on a Mac's first launch.
+ *
+ * THE WORKER GENERATES THE TOKEN, NOT THE APP, and this is a security property
+ * rather than a preference. The token is a KV key. If the app chose it, anyone
+ * could POST a token of their choosing — including one already belonging to a
+ * paying account — and either collide with it or squat it before it is issued.
+ * A client never names a key in someone else's namespace.
+ *
+ * NO AUTHENTICATION, because there is nothing yet to authenticate with: this is
+ * the endpoint that hands out the first credential. That makes it mintable in a
+ * loop by anyone who finds it, which is the same exposure as the Keychain-
+ * deletion gap recorded in SPEC.md — bounded by the trial cap, ten questions and
+ * roughly seven cents each time. Cloudflare rate limiting is the lever if it is
+ * ever actually exploited; fingerprinting is not, and the SPEC amendment says so
+ * to stop a later reader "fixing" it that way.
+ *
+ * D1 IS WRITTEN HERE AND NEVER ON THE QUESTION PATH. This route exists so that
+ * /v1/ask can read one KV record and nothing else.
+ */
+async function registerDevice(request, env) {
+  const plan = await loadPlan(env, "trial");
+  if (!plan) return problem(503, "not_provisioned");
+
+  const token = mintToken();
+
+  // The KV record carries the caps THEMSELVES, not the plan's name, because the
+  // question path must not look a plan up. That denormalisation is deliberate
+  // and it has a cost: changing a cap in D1 does not reach records already
+  // written. `npm run plans:apply` rewrites them and Bench/check-plan-sync.sh
+  // fails if the two ever disagree — see the README.
+  const record = {
+    v: 2,
+    subject: token,            // no account yet: the token is its own subject
+    kind: "trial",
+    plan: "trial",
+    active: true,
+    dailyCap: plan.daily_cap,
+    hourlyCap: plan.hourly_cap,
+    trialCap: plan.trial_cap,
+  };
+
+  await env.OTTO.put(`token:${token}`, JSON.stringify(record));
+
+  // KV FIRST, D1 SECOND. If D1 fails the user still has a working trial and we
+  // have lost a row we can reconstruct; the other order hands out a token that
+  // does not work. Neither is free, and this is the failure that is invisible
+  // to the person holding the Mac.
+  try {
+    await env.DB.prepare(
+      `INSERT INTO devices (token, account_id, label, state, created_at)
+       VALUES (?, NULL, ?, 'trial', ?)`
+    ).bind(token, labelFrom(request), Date.now()).run();
+  } catch (error) {
+    // Deliberately not surfaced: the trial works. Logged as the operational
+    // problem it is, with no token in the message.
+    console.error("device row not written:", String(error && error.message));
+  }
+
+  return new Response(JSON.stringify({ token, trialCap: plan.trial_cap }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** 32 bytes of CSPRNG, base64url. Not a UUID: this is a credential. */
+function mintToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * A human label for the device list, and nothing more.
+ *
+ * The app sends its machine name. It is never used for identity, never used to
+ * decide entitlement, and is not a fingerprint — a user renaming their Mac
+ * changes only what a row says.
+ */
+function labelFrom(request) {
+  const label = request.headers.get("otto-device-label") || "";
+  return label.slice(0, 64) || null;
+}
+
+/** Plans live in D1 so a cap is a row update rather than a deploy. */
+async function loadPlan(env, name) {
+  try {
+    return await env.DB.prepare(
+      `SELECT name, daily_cap, hourly_cap, trial_cap FROM plans WHERE name = ?`
+    ).bind(name).first();
+  } catch (error) {
+    console.error("plan lookup failed:", String(error && error.message));
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------- accounts
 
 /**
  * A token record. VERSIONED from the first day, because retrofitting a schema
  * version onto records already in production means guessing at record shape.
+ * That foresight is now being spent:
  *
- *   { v: 1, name, active, dailyCap, hourlyCap }
+ *   v1  { v: 1, name, active, dailyCap, hourlyCap }
+ *   v2  { v: 2, subject, kind, plan, active, dailyCap, hourlyCap, trialCap }
  *
- * A later version adding { plan, expiresAt, customerId } is then a migration
- * rather than an archaeology exercise.
+ * `subject` IS THE FIELD THAT MATTERS, and it is why v2 exists.
+ *
+ * Caps are per ACCOUNT, not per device: someone with a Mac and a MacBook has
+ * one quota. The counters below therefore key on the subject rather than on the
+ * token — and the subject has to be readable WITHOUT a database lookup, or the
+ * question path acquires a second store and the whole design falls over. So it
+ * is denormalised into the KV record, which is the one thing the hot path
+ * already reads.
+ *
+ * For a trial there is no account, so the subject is the token itself. That
+ * means trial and account share one code path with no branch in it.
+ *
+ * v1 RECORDS STILL WORK. Beta testers carry baked tokens minted before any of
+ * this existed; refusing them would switch off every existing user to ship a
+ * schema change. They are upgraded in memory, never rewritten, so the migration
+ * is a read-time concern and there is no batch job that can half-finish.
  */
 async function loadAccount(env, token) {
   const raw = await env.OTTO.get(`token:${token}`);
@@ -185,11 +307,28 @@ async function loadAccount(env, token) {
   } catch {
     return null;
   }
-  if (record.v !== 1) return null;
+
+  if (record.v === 1) {
+    return {
+      subject: token,          // a v1 token was its own quota, and stays so
+      kind: "legacy",
+      plan: "legacy",
+      active: record.active === true,
+      dailyCap: Number(record.dailyCap) || 0,
+      hourlyCap: Number(record.hourlyCap) || 0,
+      trialCap: 0,
+    };
+  }
+
+  if (record.v !== 2) return null;
   return {
+    subject: String(record.subject || token),
+    kind: String(record.kind || "device"),
+    plan: String(record.plan || "free"),
     active: record.active === true,
     dailyCap: Number(record.dailyCap) || 0,
     hourlyCap: Number(record.hourlyCap) || 0,
+    trialCap: Number(record.trialCap) || 0,
   };
 }
 
@@ -217,22 +356,33 @@ async function loadAccount(env, token) {
  * performs the increment — separated so the caller can schedule the write
  * instead of awaiting it.
  */
-async function checkLimits(env, token, account, timing = {}) {
+async function checkLimits(env, account, timing = {}) {
   const now = new Date();
   const day = now.toISOString().slice(0, 10);          // YYYY-MM-DD
   const hour = now.toISOString().slice(0, 13);         // YYYY-MM-DDTHH
 
-  const dayKey = `u:${token}:d:${day}`;
-  const hourKey = `u:${token}:h:${hour}`;
+  // KEYED ON THE SUBJECT, NOT THE TOKEN. Two devices on one account share one
+  // quota, which is what a subscription means to the person paying for it.
+  const dayKey = `u:${account.subject}:d:${day}`;
+  const hourKey = `u:${account.subject}:h:${hour}`;
+
+  // The trial is a LIFETIME count, so it gets its own key with NO expiry. The
+  // day and hour keys carry TTLs because a window that has rolled over is
+  // meaningless; a trial that expired after 48 hours would simply hand out a
+  // fresh ten, which is the opposite of a cap.
+  const totalKey = `u:${account.subject}:total`;
+  const onTrial = account.kind === "trial" && account.trialCap > 0;
 
   const tRead = Date.now();
-  const [dayRaw, hourRaw] = await Promise.all([
+  const [dayRaw, hourRaw, totalRaw] = await Promise.all([
     env.OTTO.get(dayKey),
     env.OTTO.get(hourKey),
+    onTrial ? env.OTTO.get(totalKey) : Promise.resolve(null),
   ]);
   timing.counterRead = Date.now() - tRead;
   const dayCount = Number(dayRaw) || 0;
   const hourCount = Number(hourRaw) || 0;
+  const totalCount = Number(totalRaw) || 0;
 
   // The hourly limit is the real protection against a runaway bill: a daily cap
   // can still be burned through in a minute by a loop.
@@ -258,11 +408,27 @@ async function checkLimits(env, token, account, timing = {}) {
       `hour-cap=${account.hourlyCap}`,
       `day-resets=${secondsToNextDay(now)}`,
       `hour-resets=${secondsToNextHour(now)}`,
+      // Only while a trial is running. Otto shows "7 of 10 free questions
+      // left" from these, and shows nothing about a trial once there is an
+      // account behind the token — the absence of the fields IS the signal.
+      ...(onTrial
+        ? [`trial=${totalCount + (inclusive ? 1 : 0)}`, `trial-cap=${account.trialCap}`]
+        : []),
     ].join(";"),
   });
 
   // The refusal carries the counts too. It is the moment a user most wants to
   // see the bar full, and it means Otto has one place that parses this.
+  // FIRST, because it is the most specific and the only one a user can act on
+  // by doing something other than waiting. "Try again in about 40 minutes" is
+  // the wrong sentence for someone whose trial is over — the hourly cap would
+  // otherwise answer first and send them away to wait for nothing.
+  //
+  // No retryAfter: there is no time at which this resolves itself.
+  if (onTrial && totalCount >= account.trialCap) {
+    return { refused: problem(403, "trial_exhausted", {}, usage(false)) };
+  }
+
   if (account.hourlyCap > 0 && hourCount >= account.hourlyCap) {
     return {
       refused: problem(429, "hourly_limit",
@@ -284,6 +450,8 @@ async function checkLimits(env, token, account, timing = {}) {
       Promise.all([
         env.OTTO.put(dayKey, String(dayCount + 1), { expirationTtl: 60 * 60 * 48 }),
         env.OTTO.put(hourKey, String(hourCount + 1), { expirationTtl: 60 * 60 * 2 }),
+        // No expirationTtl, deliberately. See the key's comment above.
+        ...(onTrial ? [env.OTTO.put(totalKey, String(totalCount + 1))] : []),
       ]),
   };
 }
