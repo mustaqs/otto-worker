@@ -6,6 +6,6 @@
     "test": "node test.mjs",
     "deploy": "node test.mjs && wrangler deploy",
     "plans:apply": "node scripts/plans-apply.mjs",
-    "check": "./Bench/check-question-path.sh && ./Bench/check-plan-sync.sh"
+    "check": "./Bench/check-no-secrets.sh && ./Bench/check-question-path.sh && ./Bench/check-plan-sync.sh"
   }
 }
