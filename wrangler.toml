@@ -16,6 +16,11 @@ preview_urls = false
 binding = "OTTO"
 id = "a8141d2bc3cf455fa4a25d20014e2832"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "otto"
+database_id = "0206e486-ed56-472d-ac58-d24c998f9cf2"
+
 [observability]
 enabled = false
 
