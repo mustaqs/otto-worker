@@ -42,6 +42,10 @@ export default {
     // or any identity provider. Bench/check-question-path.sh asserts that by
     // grep rather than by reading, in the style of the app's check-monitors.sh.
     if (url.pathname === "/v1/device") return registerDevice(request, env);
+    // Sign-in is two more routes, two more requests, and — like registration —
+    // NOT the question path. Supabase is reached from these and nowhere else.
+    if (url.pathname === "/v1/signin") return signInStart(request, env);
+    if (url.pathname === "/v1/signin/verify") return signInVerify(request, env);
 
     if (url.pathname !== "/v1/ask") return problem(404, "not_found");
 
@@ -372,19 +376,9 @@ async function loadAccount(env, token) {
  */
 async function checkLimits(env, account, timing = {}) {
   const now = new Date();
-  const day = now.toISOString().slice(0, 10);          // YYYY-MM-DD
-  const hour = now.toISOString().slice(0, 13);         // YYYY-MM-DDTHH
-
   // KEYED ON THE SUBJECT, NOT THE TOKEN. Two devices on one account share one
   // quota, which is what a subscription means to the person paying for it.
-  const dayKey = `u:${account.subject}:d:${day}`;
-  const hourKey = `u:${account.subject}:h:${hour}`;
-
-  // The trial is a LIFETIME count, so it gets its own key with NO expiry. The
-  // day and hour keys carry TTLs because a window that has rolled over is
-  // meaningless; a trial that expired after 48 hours would simply hand out a
-  // fresh ten, which is the opposite of a cap.
-  const totalKey = `u:${account.subject}:total`;
+  const { dayKey, hourKey, totalKey } = counterKeys(account.subject, now);
   const onTrial = account.kind === "trial" && account.trialCap > 0;
 
   const tRead = Date.now();
@@ -488,9 +482,281 @@ function usageHeader(account, counts, now, inclusive) {
   };
 }
 
+/**
+ * The counter keys for a subject at a moment. Pure, so the question path and
+ * sign-in's usage reply agree on the key format by construction rather than by
+ * two copies of a template string.
+ *
+ * The trial is a LIFETIME count, so it gets its own key with NO expiry. The day
+ * and hour keys carry TTLs (set where they are written) because a window that
+ * has rolled over is meaningless; a trial that expired after 48 hours would
+ * simply hand out a fresh ten, which is the opposite of a cap.
+ */
+function counterKeys(subject, now) {
+  const day = now.toISOString().slice(0, 10);          // YYYY-MM-DD
+  const hour = now.toISOString().slice(0, 13);         // YYYY-MM-DDTHH
+  return {
+    dayKey: `u:${subject}:d:${day}`,
+    hourKey: `u:${subject}:h:${hour}`,
+    totalKey: `u:${subject}:total`,
+  };
+}
+
 const secondsToNextHour = (now) => 3600 - (now.getUTCMinutes() * 60 + now.getUTCSeconds());
 const secondsToNextDay = (now) =>
   86400 - (now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds());
+
+// ----------------------------------------------------------------- sign-in
+
+/**
+ * Sign-in: a six-digit code sent to an email address, checked by Supabase, and
+ * a device token bound to an account issued in exchange. Two routes, two
+ * requests, and — like registration — NOT the question path. SPEC.md A70.
+ *
+ * SUPABASE IS REACHED FROM HERE AND NOWHERE ELSE. Otto never holds a Supabase
+ * credential of any kind; the key lives in this Worker, is read in exactly one
+ * function (`supabase`), and is sent as the `apikey` header — it is a
+ * per-service secret key (sb_secret_…), not a JWT, so it is never a bearer.
+ * Bench/check-question-path.sh asserts the single reader and that neither
+ * route is reachable from /v1/ask.
+ *
+ * WHAT IS NEVER LOGGED: the address, the code, either token, the key, and the
+ * Supabase session. Error lines say which step failed, not for whom.
+ *
+ * BOTH ROUTES REQUIRE A DEVICE TOKEN (D3). A registered device — trial, legacy
+ * or account — may ask for a code; nothing else may. That makes the mailer cost
+ * a registration per attempt rather than being an open sender through
+ * sayotto.app's new and fragile reputation.
+ */
+
+/** The bearer, validated the way /v1/ask validates it. */
+async function authenticate(request, env) {
+  const token = bearer(request);
+  if (!token) return { refused: problem(401, "missing_token") };
+  const account = await loadAccount(env, token);
+  if (!account) return { refused: problem(401, "unknown_token") };
+  if (!account.active) return { refused: problem(403, "revoked") };
+  return { token, account };
+}
+
+/**
+ * Trim, lowercase, and require exactly one `@` with something either side.
+ * Nothing more: Supabase and the mail provider are the authorities on what is
+ * deliverable, and a stricter regex here would refuse real addresses.
+ */
+function normaliseEmail(value) {
+  const email = String(value || "").trim().toLowerCase();
+  const at = email.indexOf("@");
+  if (at < 1 || at !== email.lastIndexOf("@") || at === email.length - 1) return null;
+  return email;
+}
+
+/**
+ * One call to Supabase Auth. THE ONLY READER OF THE KEY.
+ *
+ * Returns `{ unavailable: true }` for anything that is our problem rather than
+ * the user's — no configuration, no network, a 5xx — so callers map it to one
+ * sentence ("could not reach its sign-in service") and never leak which.
+ */
+async function supabase(env, path, body) {
+  const key = env.SUPABASE_SECRET_KEY;   // read once; the only read in this file
+  if (!env.SUPABASE_URL || !key) {
+    console.error("sign-in is not provisioned: SUPABASE_URL or the secret key is missing");
+    return { unavailable: true };
+  }
+  let response;
+  try {
+    response = await fetch(`${env.SUPABASE_URL}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", apikey: key },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    // THE ERROR'S MESSAGE IS NOT LOGGED. A transport error can carry the
+    // request into its string form, and the request carries the address.
+    // The name of the error class says what happened; nothing else is needed.
+    console.error(`identity provider unreachable at ${path} (${error && error.name ? error.name : "error"})`);
+    return { unavailable: true };
+  }
+  if (response.status >= 500) {
+    console.error(`identity provider failed at ${path}: HTTP ${response.status}`);
+    return { unavailable: true };
+  }
+  let json = null;
+  try { json = await response.json(); } catch { json = null; }
+  return { status: response.status, json, retryAfter: Number(response.headers.get("retry-after")) || 0 };
+}
+
+function json200(object, headers = {}) {
+  return new Response(JSON.stringify(object), {
+    status: 200,
+    headers: { "content-type": "application/json", "cache-control": "no-store", ...headers },
+  });
+}
+
+/**
+ * POST /v1/signin  { email }  →  200 {}
+ *
+ * Asks Supabase to email a code. WRITES NOTHING — no row, no key, no log line
+ * with the address in it; the address exists in this isolate for the length of
+ * one fetch. The reply is the same for a new address and a returning one, so a
+ * caller cannot learn whether an address is known.
+ */
+async function signInStart(request, env) {
+  const auth = await authenticate(request, env);
+  if (auth.refused) return auth.refused;
+
+  let body;
+  try { body = await request.json(); } catch { return problem(400, "malformed_json"); }
+  const email = normaliseEmail(body && body.email);
+  if (!email) return problem(400, "bad_email");
+
+  // create_user: a first sign-in IS the sign-up. Supabase picks the template.
+  const reply = await supabase(env, "/auth/v1/otp", { email, create_user: true });
+  if (reply.unavailable) return problem(503, "identity_unavailable");
+  if (reply.status === 429) return problem(429, "rate_limited", { retryAfter: reply.retryAfter || 60 });
+  if (reply.status === 400 || reply.status === 422) return problem(400, "bad_email");
+  if (reply.status !== 200) {
+    // A 401/403 here is OUR key or configuration, never the user's address.
+    console.error(`code not sent: identity provider answered HTTP ${reply.status}`);
+    return problem(503, "identity_unavailable");
+  }
+  return json200({});
+}
+
+/**
+ * POST /v1/signin/verify  { email, code }  →  200 { token, email } + otto-usage
+ *
+ * Checks the code with Supabase, then REPLACES the bearer's token with one bound
+ * to the account (A62: replace, do not adopt). In order:
+ *
+ *   1. Supabase verifies. Only `user.id` and `user.email` are read from the
+ *      session; the access and refresh tokens are DISCARDED here and never
+ *      stored, forwarded or logged. Otto never holds a Supabase credential.
+ *   2. The account is found by Supabase user id, relinked by email if the
+ *      identity was recreated upstream, or created on the plan D2 chose: `beta`
+ *      for a legacy (baked v1) bearer, `free` for everything else.
+ *   3. A new token is minted and its KV record written with subject = the
+ *      ACCOUNT id, so two Macs on one account share one quota.
+ *   4. D1 rows: the new device inserted, the old one revoked. KV FIRST, D1
+ *      SECOND, as registration does: a failure here leaves a working token and
+ *      a reconstructible row, and is logged without token or address.
+ *   5. The bearer's own KV record is retired (active: false) — unless it is a
+ *      v1 record, which are set by hand and never rewritten (A62). The ten
+ *      trial questions are forgiven, not carried: the account's counters are
+ *      the account's, and the trial's are simply never read again.
+ *   6. The reply carries the account's current counters in the usage header —
+ *      a second Mac signing in sees what the first has spent. This read is
+ *      off the question path, so it is allowed.
+ */
+async function signInVerify(request, env) {
+  const auth = await authenticate(request, env);
+  if (auth.refused) return auth.refused;
+
+  let body;
+  try { body = await request.json(); } catch { return problem(400, "malformed_json"); }
+  const email = normaliseEmail(body && body.email);
+  if (!email) return problem(400, "bad_email");
+  const code = String((body && body.code) || "").trim();
+  // Malformed and wrong get one sentence: Supabase does not reliably separate
+  // an expired code from a wrong one either, so neither do we.
+  if (!/^\d{6}$/.test(code)) return problem(403, "code_invalid");
+
+  const reply = await supabase(env, "/auth/v1/verify", { type: "email", email, token: code });
+  if (reply.unavailable) return problem(503, "identity_unavailable");
+  if (reply.status === 429) return problem(429, "rate_limited", { retryAfter: reply.retryAfter || 60 });
+  const supabaseUser = reply.status === 200 && reply.json && reply.json.user;
+  if (!supabaseUser || !supabaseUser.id) return problem(403, "code_invalid");
+  // THE SESSION ENDS HERE. Two fields survive; nothing else from the reply is
+  // referenced again, so nothing else can be written anywhere.
+  const user = { id: String(supabaseUser.id), email: normaliseEmail(supabaseUser.email) || email };
+
+  const planForNewAccount = auth.account.kind === "legacy" ? "beta" : "free";
+  let account;
+  try {
+    account = await findOrCreateAccount(env, user, planForNewAccount);
+  } catch (error) {
+    console.error("account lookup failed:", String(error && error.message));
+    return problem(503, "identity_unavailable");
+  }
+
+  const caps = await loadPlan(env, account.plan);
+  if (!caps) return problem(503, "not_provisioned");
+
+  const token = mintToken();
+  const record = {
+    v: 2,
+    subject: account.id,        // the ACCOUNT: two devices, one quota
+    kind: "device",
+    plan: account.plan,
+    active: true,
+    dailyCap: caps.daily_cap,
+    hourlyCap: caps.hourly_cap,
+    trialCap: caps.trial_cap,
+  };
+  await env.OTTO.put(`token:${token}`, JSON.stringify(record));
+
+  const now = Date.now();
+  try {
+    await env.DB.prepare(
+      `INSERT INTO devices (token, account_id, label, state, created_at)
+       VALUES (?, ?, ?, 'active', ?)`
+    ).bind(token, account.id, labelFrom(request), now).run();
+    await env.DB.prepare(
+      `UPDATE devices SET state = 'revoked', revoked_at = ? WHERE token = ? AND state != 'revoked'`
+    ).bind(now, auth.token).run();
+  } catch (error) {
+    console.error("device rows not written:", String(error && error.message));
+  }
+
+  if (auth.account.kind !== "legacy") {
+    try {
+      const raw = await env.OTTO.get(`token:${auth.token}`);
+      const old = raw ? JSON.parse(raw) : null;
+      if (old) await env.OTTO.put(`token:${auth.token}`, JSON.stringify({ ...old, active: false }));
+    } catch (error) {
+      console.error("previous token not retired:", String(error && error.message));
+    }
+  }
+
+  const at = new Date();
+  const keys = counterKeys(account.id, at);
+  const [dayRaw, hourRaw] = await Promise.all([env.OTTO.get(keys.dayKey), env.OTTO.get(keys.hourKey)]);
+  const header = usageHeader(record, { day: Number(dayRaw) || 0, hour: Number(hourRaw) || 0, total: 0 }, at, false);
+  return json200({ token, email: user.email }, header);
+}
+
+/**
+ * The account behind a Supabase user, created if this is its first sign-in.
+ *
+ * Matched by Supabase user id first, so an address change upstream does not
+ * fork an account. An address that exists WITHOUT this id means the identity
+ * was recreated on the Supabase side; it is relinked rather than duplicated,
+ * which the UNIQUE constraint on email would refuse anyway.
+ */
+async function findOrCreateAccount(env, user, plan) {
+  const byUser = await env.DB.prepare(
+    `SELECT id, plan FROM accounts WHERE supabase_user_id = ? AND deleted_at IS NULL`
+  ).bind(user.id).first();
+  if (byUser) return byUser;
+
+  const byEmail = await env.DB.prepare(
+    `SELECT id, plan FROM accounts WHERE email = ? AND deleted_at IS NULL`
+  ).bind(user.email).first();
+  if (byEmail) {
+    await env.DB.prepare(`UPDATE accounts SET supabase_user_id = ? WHERE id = ?`)
+      .bind(user.id, byEmail.id).run();
+    return byEmail;
+  }
+
+  // An id, not a credential: it names a quota, it never authenticates one.
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO accounts (id, email, supabase_user_id, plan, created_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).bind(id, user.email, user.id, plan, Date.now()).run();
+  return { id, plan };
+}
 
 // -------------------------------------------------------------- validation
 

@@ -103,6 +103,42 @@ case "$(body registerDevice)" in
     *)        check "registration no longer writes D1 — where did it move?" 1 ;;
 esac
 
+echo "sign-in isolation (A70):"
+
+# THE KEY HAS EXACTLY ONE READER, and it is the function that talks to
+# Supabase. A second reader is a second place the key can leak.
+# FAILING EDIT: read env.SUPABASE_SECRET_KEY in signInStart.
+readers=$(grep -c "env\.SUPABASE_SECRET_KEY" "$SRC")
+inside=$(body supabase | grep -c "env\.SUPABASE_SECRET_KEY")
+if [ "$readers" = "1" ] && [ "$inside" = "1" ]; then
+    check "the secret key is read in exactly one function, supabase()" 0
+else
+    check "the secret key is read in exactly one function, supabase()" 1
+    printf '       readers in file: %s, inside supabase(): %s\n' "$readers" "$inside"
+fi
+
+# SUPABASE IS CALLED FROM THE TWO SIGN-IN ROUTES AND NOWHERE ELSE. Counted
+# outside their bodies rather than searched for in the question path, so a
+# call added to registration — or anywhere new — is caught too.
+# FAILING EDIT: call supabase(env, ...) from registerDevice.
+total=$(grep -v "function supabase(" "$SRC" | grep -c "supabase(env")
+allowed=$(for fn in signInStart signInVerify; do body "$fn"; done | grep -c "supabase(env")
+if [ "$total" -gt 0 ] && [ "$total" = "$allowed" ]; then
+    check "supabase() is called only from signInStart and signInVerify" 0
+else
+    check "supabase() is called only from signInStart and signInVerify" 1
+    printf '       calls in file: %s, inside the two routes: %s\n' "$total" "$allowed"
+fi
+
+# NEVER THE ADDRESS, THE CODE, OR A TOKEN IN A LOG LINE. Asserted on the
+# console calls inside the sign-in functions, including the helper that holds
+# the address longest.
+# FAILING EDIT: add `console.error(\`failed for ${email}\`)` to signInStart.
+leaks=$(for fn in signInStart signInVerify findOrCreateAccount supabase authenticate; do body "$fn"; done \
+        | grep "console\." | grep -cE '\$\{(email|code|token|user\.email|auth\.token|body)')
+[ "$leaks" = "0" ]
+check "no log line in the sign-in functions interpolates an address, code or token" $?
+
 echo
 if [ "$fail" = "0" ]; then echo "QUESTION PATH OK"; else
     echo "QUESTION PATH FAILED — $fail check(s)"; fi

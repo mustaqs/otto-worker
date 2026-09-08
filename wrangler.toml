@@ -25,6 +25,11 @@ database_id = "0206e486-ed56-472d-ac58-d24c998f9cf2"
 enabled = false
 
 [vars]
+# Where sign-in's identity provider lives. NOT A SECRET — the key is. The key is
+# SUPABASE_SECRET_KEY, set with `wrangler secret put`, a per-service secret key
+# (sb_secret_…) sent as the `apikey` header and never as a bearer. It is read in
+# exactly one function; Bench/check-question-path.sh asserts that.
+SUPABASE_URL = "https://rfseqzmwzvzszdbzspjc.supabase.co"
 # Bounds what a leaked token can do. See README: a token is not a general
 # purpose Anthropic proxy.
 MAX_BODY_BYTES = "6000000"

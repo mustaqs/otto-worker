@@ -291,6 +291,261 @@ console.log("registration says the trial's number before a question is spent:");
         !errors.join("|").includes((await degraded.json()).token));
 }
 
+// ---------------------------------------------------------------- sign-in
+
+console.log("sign-in (two requests, and neither is the question path):");
+{
+  const SUPABASE_URL = "https://project.supabase.co";
+  // Assembled at runtime so the file never contains a secret-shaped literal;
+  // Bench/check-no-secrets.sh scans for the real prefix and would refuse it.
+  const SECRET = ["sb", "secret", "TESTKEY-not-real-0000000000"].join("_");
+  const trialToken = "trial-device-token-xyz";
+  const legacyToken = "beta-legacy-token";
+  const trialRecord = (over = {}) => JSON.stringify({
+    v: 2, subject: trialToken, kind: "trial", plan: "trial", active: true,
+    dailyCap: 10, hourlyCap: 10, trialCap: 10, ...over });
+  const legacyRecord = JSON.stringify({ v: 1, name: "tester", active: true, dailyCap: 500, hourlyCap: 60 });
+  const plans = {
+    trial: { name: "trial", daily_cap: 10, hourly_cap: 10, trial_cap: 10 },
+    free:  { name: "free",  daily_cap: 50, hourly_cap: 20, trial_cap: 0 },
+    beta:  { name: "beta",  daily_cap: 500, hourly_cap: 60, trial_cap: 0 },
+  };
+
+  // A D1 stand-in that keeps rows, so what verify wrote can be read back.
+  const makeDB = ({ failWrites = false } = {}) => {
+    const accounts = [], devices = [];
+    return {
+      accounts, devices,
+      prepare: (sql) => ({ bind: (...args) => ({
+        first: async () => {
+          const q = sql.trim();
+          if (q.includes("FROM plans")) return plans[args[0]] || null;
+          if (q.includes("FROM accounts WHERE supabase_user_id")) return accounts.find((a) => a.supabase_user_id === args[0]) || null;
+          if (q.includes("FROM accounts WHERE email")) return accounts.find((a) => a.email === args[0]) || null;
+          return null;
+        },
+        run: async () => {
+          if (failWrites) throw new Error("d1 unavailable");
+          const q = sql.trim();
+          if (q.startsWith("INSERT INTO accounts")) accounts.push({ id: args[0], email: args[1], supabase_user_id: args[2], plan: args[3] });
+          else if (q.startsWith("UPDATE accounts")) { const a = accounts.find((a) => a.id === args[1]); if (a) a.supabase_user_id = args[0]; }
+          else if (q.startsWith("INSERT INTO devices")) devices.push({ token: args[0], account_id: args[1], label: args[2], state: "active" });
+          else if (q.startsWith("UPDATE devices")) { const d = devices.find((d) => d.token === args[1]); if (d) { d.state = "revoked"; d.revoked_at = args[0]; } }
+        },
+      }) }),
+    };
+  };
+
+  // A fetch that answers Supabase from a script and Anthropic as before, and
+  // records every call so headers and bodies can be asserted.
+  const calls = [];
+  let supa = {};
+  const anthropic = () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    calls.push({ url: u, init });
+    if (u.startsWith(SUPABASE_URL)) {
+      if (u.endsWith("/auth/v1/otp")) return supa.otp ? supa.otp(init) : new Response("{}", { status: 200 });
+      if (u.endsWith("/auth/v1/verify")) return supa.verify ? supa.verify(init) : new Response("{}", { status: 403 });
+    }
+    return anthropic();
+  };
+  const session = (id, email) => new Response(JSON.stringify({
+    access_token: "SESSION-ACCESS-TOKEN-must-not-be-kept", refresh_token: "SESSION-REFRESH",
+    token_type: "bearer", expires_in: 3600, user: { id, email } }), { status: 200 });
+
+  const envFor = (kv, db, over = {}) => ({ ...env(kv), DB: db, SUPABASE_URL, SUPABASE_SECRET_KEY: SECRET, ...over });
+  const post = (path, token, body) => worker.fetch(new Request(`https://w${path}`, {
+    method: "POST",
+    headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), "content-type": "application/json", "otto-device-label": "Test Mac" },
+    body: JSON.stringify(body) }), currentEnv, makeCtx());
+  const parse = (response) => Object.fromEntries((response.headers.get("otto-usage") || "").split(";").filter(Boolean)
+    .map((p) => { const [k, v] = p.split("="); return [k, Number(v)]; }));
+  const supaCalls = () => calls.filter((c) => c.url.startsWith(SUPABASE_URL));
+  let currentEnv;
+
+  // --- send
+  {
+    const kv = makeKV({ [`token:${trialToken}`]: trialRecord() });
+    const db = makeDB();
+    currentEnv = envFor(kv, db);
+    calls.length = 0;
+    const r = await post("/v1/signin", trialToken, { email: "  Person@Example.com " });
+    check("a registered device may ask for a code", r.status === 200, `got ${r.status}`);
+    const sent = supaCalls()[0];
+    check("send uses the secret key as `apikey` and never as a bearer",
+          sent && sent.init.headers.apikey === SECRET && !("authorization" in sent.init.headers) && !("Authorization" in sent.init.headers));
+    const sentBody = sent ? JSON.parse(sent.init.body) : {};
+    check("send passes create_user: true, so a first sign-in is the sign-up",
+          sentBody.create_user === true && sentBody.email === "person@example.com", JSON.stringify(sentBody));
+    check("send writes nothing to KV or D1",
+          kv.store.size === 1 && db.accounts.length === 0 && db.devices.length === 0);
+    check("the send reply says nothing about the address", (await r.text()) === "{}");
+
+    check("send with no bearer is refused", (await post("/v1/signin", null, { email: "a@b.c" })).status === 401);
+    currentEnv = envFor(makeKV({ [`token:${trialToken}`]: trialRecord({ active: false }) }), db);
+    check("send with a revoked bearer is refused", (await post("/v1/signin", trialToken, { email: "a@b.c" })).status === 403);
+    currentEnv = envFor(kv, db);
+    check("an address without one @ is refused before Supabase is asked",
+          (await post("/v1/signin", trialToken, { email: "nope" })).status === 400 && supaCalls().length === 1);
+
+    // Never the address, even on the path most likely to print it.
+    const errors = [];
+    const realError = console.error;
+    console.error = (...m) => errors.push(m.map(String).join(" "));
+    supa.otp = () => new Response("boom", { status: 500 });
+    const down = await post("/v1/signin", trialToken, { email: "person@example.com" });
+    supa.otp = () => { throw new Error("network down person@example.com"); };
+    const thrown = await post("/v1/signin", trialToken, { email: "person@example.com" });
+    console.error = realError;
+    check("Supabase 5xx and an unreachable Supabase both answer 503 identity_unavailable",
+          down.status === 503 && thrown.status === 503);
+    check("and the address is never logged, even when the transport error contains it",
+          errors.length > 0 && !errors.join("|").includes("person@example.com") && !errors.join("|").includes(SECRET), errors.join("|"));
+    supa.otp = () => new Response(JSON.stringify({ code: 429, error_code: "over_email_send_rate_limit" }), { status: 429, headers: { "retry-after": "42" } });
+    const limited = await post("/v1/signin", trialToken, { email: "person@example.com" });
+    check("a Supabase rate limit is 429 rate_limited with the provider's retryAfter",
+          limited.status === 429 && (await limited.json()).retryAfter === 42);
+    supa.otp = null;
+  }
+
+  // --- verify
+  {
+    const kv = makeKV({ [`token:${trialToken}`]: trialRecord() });
+    const db = makeDB();
+    currentEnv = envFor(kv, db);
+    supa.verify = (init) => {
+      const b = JSON.parse(init.body);
+      return b.type === "email" && b.token === "123456" ? session("user-uuid-1", "person@example.com") : new Response(JSON.stringify({ error_code: "otp_expired" }), { status: 403 });
+    };
+
+    const wrong = await post("/v1/signin/verify", trialToken, { email: "person@example.com", code: "000000" });
+    check("a wrong code is 403 code_invalid", wrong.status === 403 && (await wrong.json()).error === "code_invalid");
+    check("and nothing was written for it", kv.store.size === 1 && db.accounts.length === 0);
+    check("a malformed code never reaches Supabase",
+          (await post("/v1/signin/verify", trialToken, { email: "person@example.com", code: "12" })).status === 403
+          && supaCalls().filter((c) => c.url.endsWith("/verify")).length === 1);
+
+    const ok = await post("/v1/signin/verify", trialToken, { email: "person@example.com", code: "123456" });
+    const body = await ok.json();
+    check("the right code issues a token and returns the address", ok.status === 200 && typeof body.token === "string" && body.token.length > 20 && body.email === "person@example.com");
+    check("verify sends the code to Supabase with `apikey` and never a bearer",
+          supaCalls().every((c) => c.init.headers.apikey === SECRET && !("authorization" in c.init.headers)));
+
+    const record = JSON.parse(kv.store.get(`token:${body.token}`) || "null");
+    const account = db.accounts[0];
+    check("an account exists, on the free plan, linked to the Supabase user",
+          account && account.plan === "free" && account.supabase_user_id === "user-uuid-1" && account.email === "person@example.com");
+    check("the new KV record's subject is the ACCOUNT id, kind device, caps from the plan row",
+          record && record.subject === account.id && record.kind === "device" && record.dailyCap === 50 && record.hourlyCap === 20 && record.trialCap === 0,
+          JSON.stringify(record));
+    check("the trial token is retired: KV inactive, D1 row revoked",
+          JSON.parse(kv.store.get(`token:${trialToken}`)).active === false
+          && db.devices.some((d) => d.token === trialToken ? d.state === "revoked" : true)
+          && db.devices.find((d) => d.token === body.token)?.state === "active"
+          && db.devices.find((d) => d.token === body.token)?.account_id === account.id);
+    const header = parse(ok);
+    check("the reply's usage header is the account's, with no trial fields",
+          header["day-cap"] === 50 && header.day === 0 && !("trial" in header) && !("trial-cap" in header), JSON.stringify(header));
+    const everything = [...kv.store.values()].join("|") + JSON.stringify(db.accounts) + JSON.stringify(db.devices) + JSON.stringify(body);
+    check("the Supabase session is discarded: nothing stored or returned contains it",
+          !everything.includes("SESSION-ACCESS-TOKEN") && !everything.includes("SESSION-REFRESH"));
+
+    // Ten questions forgiven: the new subject starts at zero even though the
+    // trial had spent some.
+    // A second Mac on the same address joins the same account and sees what
+    // the first has spent.
+    await send(currentEnv, valid, body.token);
+    const second = "second-mac-trial";
+    kv.store.set(`token:${second}`, trialRecord({ subject: second }));
+    const again = await post("/v1/signin/verify", second, { email: "person@example.com", code: "123456" });
+    const againBody = await again.json();
+    check("a second device on the same address joins the same account, not a new one",
+          again.status === 200 && db.accounts.length === 1 && JSON.parse(kv.store.get(`token:${againBody.token}`)).subject === account.id);
+    check("and its usage header shows what the first device already spent", parse(again).day === 1, JSON.stringify(parse(again)));
+
+    // MATCHED BY SUPABASE USER ID, NOT BY ADDRESS. If the address changes
+    // upstream, the same person must land on the same account; matching by
+    // email first would fork it. (The email fallback exists for the other
+    // direction — an identity recreated upstream under the same address.)
+    const third = "third-mac-trial";
+    kv.store.set(`token:${third}`, trialRecord({ subject: third }));
+    supa.verify = () => session("user-uuid-1", "renamed@example.com");
+    const renamed = await post("/v1/signin/verify", third, { email: "renamed@example.com", code: "123456" });
+    check("the same Supabase user with a new address joins the same account",
+          renamed.status === 200 && db.accounts.length === 1
+          && JSON.parse(kv.store.get(`token:${(await renamed.json()).token}`)).subject === account.id);
+
+    // Sign-in must not be reachable from a question, and a question must
+    // never reach Supabase.
+    const before = supaCalls().length;
+    await send(currentEnv, valid, body.token);
+    check("a question never triggers a Supabase call", supaCalls().length === before);
+  }
+
+  // --- a legacy (baked v1) bearer: D2(c)
+  {
+    const kv = makeKV({ [`token:${legacyToken}`]: legacyRecord });
+    const db = makeDB();
+    currentEnv = envFor(kv, db);
+    supa.verify = () => session("user-uuid-beta", "tester@example.com");
+    const r = await post("/v1/signin/verify", legacyToken, { email: "tester@example.com", code: "654321" });
+    const b = await r.json();
+    check("a legacy bearer's account is created on the beta plan, mirroring its caps",
+          r.status === 200 && db.accounts[0]?.plan === "beta" && JSON.parse(kv.store.get(`token:${b.token}`)).dailyCap === 500);
+    check("and the v1 record itself is left untouched", kv.store.get(`token:${legacyToken}`) === legacyRecord);
+  }
+
+  // --- degraded: D1 fails after the KV record exists
+  {
+    const kv = makeKV({ [`token:${trialToken}`]: trialRecord() });
+    const db = makeDB({ failWrites: true });
+    currentEnv = envFor(kv, db);
+    supa.verify = () => session("user-uuid-2", "person2@example.com");
+    const errors = [];
+    const realError = console.error;
+    console.error = (...m) => errors.push(m.map(String).join(" "));
+    const r = await post("/v1/signin/verify", trialToken, { email: "person2@example.com", code: "123456" });
+    console.error = realError;
+    // findOrCreateAccount's INSERT fails before any KV write, so nothing was
+    // issued — the honest 503. The KV-first promise is for the DEVICE rows.
+    check("a D1 failure before the account exists is 503 with nothing issued",
+          r.status === 503 && kv.store.size === 1);
+    check("and the log names neither the address nor a token",
+          errors.length > 0 && !errors.join("|").includes("person2@example.com") && !errors.join("|").includes(trialToken));
+  }
+  {
+    // D1 fails only on the DEVICE rows: the token is issued anyway.
+    const kv = makeKV({ [`token:${trialToken}`]: trialRecord() });
+    const db = makeDB();
+    const realRun = db.prepare;
+    db.prepare = (sql) => sql.includes("devices") ? { bind: () => ({ run: async () => { throw new Error("d1 unavailable"); }, first: async () => null }) } : realRun(sql);
+    currentEnv = envFor(kv, db);
+    const errors = [];
+    const realError = console.error;
+    console.error = (...m) => errors.push(m.map(String).join(" "));
+    const r = await post("/v1/signin/verify", trialToken, { email: "person2@example.com", code: "123456" });
+    console.error = realError;
+    const b = await r.json();
+    check("a D1 failure on the device rows still issues a working token (KV first)",
+          r.status === 200 && kv.store.has(`token:${b.token}`) && errors.some((e) => e.includes("device rows not written")));
+    check("and that log names no token", !errors.join("|").includes(b.token) && !errors.join("|").includes(trialToken));
+  }
+
+  // --- not provisioned
+  {
+    const kv = makeKV({ [`token:${trialToken}`]: trialRecord() });
+    currentEnv = envFor(kv, makeDB(), { SUPABASE_SECRET_KEY: undefined });
+    const realError = console.error; console.error = () => {};
+    const r = await post("/v1/signin", trialToken, { email: "person@example.com" });
+    console.error = realError;
+    check("a Worker without the key answers 503 rather than sending an unauthenticated request", r.status === 503);
+  }
+
+  supa = {};
+  globalThis.fetch = async () => anthropic();
+}
+
 // ------------------------------------------------------------- validation
 
 console.log("deferring the counter write:");

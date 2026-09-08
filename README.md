@@ -124,6 +124,31 @@ Revoke — also `--remote`:
     wrangler kv key put --remote --binding=OTTO "token:beta-alice-7f3a" \
       '{"v":1,"name":"alice","active":false,"dailyCap":200,"hourlyCap":40}'
 
+## Sign-in
+
+Two routes, both requiring a device token as bearer, neither on the question
+path (SPEC.md A70):
+
+    POST /v1/signin          { "email": "…" }              → 200 {}
+    POST /v1/signin/verify   { "email": "…", "code": "…" } → 200 { "token", "email" } + otto-usage
+
+Supabase is reached from these and nowhere else. The credential is a
+per-service **secret key** (`sb_secret_…`), sent as the `apikey` header and
+never as a bearer, stored as a Worker secret:
+
+    wrangler secret put SUPABASE_SECRET_KEY
+
+`SUPABASE_URL` is a plain `[vars]` entry in `wrangler.toml`. The key is read in
+exactly one function and neither route is reachable from `/v1/ask`;
+`Bench/check-question-path.sh` asserts both. Nothing about an address, a code,
+a token or the Supabase session is ever logged or stored beyond the account's
+email in D1.
+
+Plans: `free` (50/20) for a trial device that signs in; `beta` (500/60,
+mirroring the one hand-set v1 record) for a baked v1 token that signs in, so an
+existing tester keeps their caps (D2). Both rows come from
+`migrations/0002_stage2_plans.sql`.
+
 ## Tests
 
     node test.mjs
