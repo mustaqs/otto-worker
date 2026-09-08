@@ -233,9 +233,23 @@ async function registerDevice(request, env) {
     console.error("device row not written:", String(error && error.message));
   }
 
+  /*
+   * THE INITIAL STATE RIDES ON THE REGISTRATION REPLY, in the same header the
+   * answer carries, so Otto has one parser and the panel has something to show
+   * before the first question is spent. The counts are zero by construction —
+   * a token minted a millisecond ago has a fresh subject and no counters — so
+   * nothing is read for this; it is the record just written, said back.
+   *
+   * No new request exists: registration was already one. A26's claim that a
+   * question is one request and nothing else is untouched.
+   */
+  const now = new Date();
   return new Response(JSON.stringify({ token, trialCap: plan.trial_cap }), {
     status: 200,
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...usageHeader(record, { day: 0, hour: 0, total: 0 }, now, false),
+    },
   });
 }
 
@@ -400,22 +414,8 @@ async function checkLimits(env, account, timing = {}) {
    * day for anyone west of Greenwich; "resets in 6h" is true everywhere and
    * needs no timezone to exist anywhere in the system.
    */
-  const usage = (inclusive) => ({
-    "otto-usage": [
-      `day=${dayCount + (inclusive ? 1 : 0)}`,
-      `day-cap=${account.dailyCap}`,
-      `hour=${hourCount + (inclusive ? 1 : 0)}`,
-      `hour-cap=${account.hourlyCap}`,
-      `day-resets=${secondsToNextDay(now)}`,
-      `hour-resets=${secondsToNextHour(now)}`,
-      // Only while a trial is running. Otto shows "7 of 10 free questions
-      // left" from these, and shows nothing about a trial once there is an
-      // account behind the token — the absence of the fields IS the signal.
-      ...(onTrial
-        ? [`trial=${totalCount + (inclusive ? 1 : 0)}`, `trial-cap=${account.trialCap}`]
-        : []),
-    ].join(";"),
-  });
+  const usage = (inclusive) =>
+    usageHeader(account, { day: dayCount, hour: hourCount, total: totalCount }, now, inclusive);
 
   // The refusal carries the counts too. It is the moment a user most wants to
   // see the bar full, and it means Otto has one place that parses this.
@@ -453,6 +453,38 @@ async function checkLimits(env, account, timing = {}) {
         // No expirationTtl, deliberately. See the key's comment above.
         ...(onTrial ? [env.OTTO.put(totalKey, String(totalCount + 1))] : []),
       ]),
+  };
+}
+
+/**
+ * The `otto-usage` header, from counts already in hand.
+ *
+ * ONE FUNCTION FOR BOTH PLACES IT IS SENT: on every answer and refusal, and on
+ * the registration reply. Two compositions of the same header would drift the
+ * moment one gained a field, and Otto has exactly one parser for it.
+ *
+ * `inclusive` adds the request being answered, because checkLimits reads the
+ * counters before the increment is scheduled and reporting the raw read would
+ * leave the display one question behind forever. Registration passes false:
+ * nothing is being spent.
+ *
+ * The trial fields appear only while a trial is running. Otto shows "7 of 10
+ * free questions left" from them and shows nothing about a trial once there is
+ * an account behind the token — the ABSENCE of the fields is the signal.
+ */
+function usageHeader(account, counts, now, inclusive) {
+  const onTrial = account.kind === "trial" && Number(account.trialCap) > 0;
+  const plus = inclusive ? 1 : 0;
+  return {
+    "otto-usage": [
+      `day=${counts.day + plus}`,
+      `day-cap=${account.dailyCap}`,
+      `hour=${counts.hour + plus}`,
+      `hour-cap=${account.hourlyCap}`,
+      `day-resets=${secondsToNextDay(now)}`,
+      `hour-resets=${secondsToNextHour(now)}`,
+      ...(onTrial ? [`trial=${counts.total + plus}`, `trial-cap=${account.trialCap}`] : []),
+    ].join(";"),
   };
 }
 

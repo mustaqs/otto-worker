@@ -216,6 +216,81 @@ console.log("usage reported back to the person it is about:");
         !/[a-zA-Z]{4,}/.test(raw.replace(/day|cap|hour|resets/g, "")), raw);
 }
 
+// ----------------------------------------------------------- registration
+
+console.log("registration says the trial's number before a question is spent:");
+{
+  // A D1 stand-in with the prepare/bind/first/run surface registerDevice uses.
+  const makeDB = (plan, { failInsert = false } = {}) => {
+    const runs = [];
+    return {
+      runs,
+      prepare: (sql) => ({
+        bind: (...args) => ({
+          first: async () => (sql.includes("FROM plans") ? plan : null),
+          run: async () => {
+            if (failInsert) throw new Error("d1 unavailable");
+            runs.push({ sql, args });
+          },
+        }),
+      }),
+    };
+  };
+  const parse = (response) => {
+    const raw = response.headers.get("otto-usage") || "";
+    return Object.fromEntries(raw.split(";").filter(Boolean).map((p) => {
+      const [k, v] = p.split("=");
+      return [k, Number(v)];
+    }));
+  };
+  const register = (envObj) =>
+    worker.fetch(new Request("https://w/v1/device", {
+      method: "POST", headers: { "otto-device-label": "Test Mac" } }), envObj, makeCtx());
+
+  const plan = { name: "trial", daily_cap: 10, hourly_cap: 10, trial_cap: 10 };
+  const kv = makeKV();
+  const response = await register({ ...env(kv), DB: makeDB(plan) });
+  const body = await response.json();
+  check("a device is issued a token", response.status === 200 && typeof body.token === "string" && body.token.length > 20);
+
+  // THE GAP THIS EXISTS TO CLOSE. The panel read "No questions yet" until the
+  // first answer, because the counts only ever arrived on an answer. A new
+  // user should see "10 free questions" before spending one — that is when
+  // the trial is doing its selling.
+  const initial = parse(response);
+  check("the reply carries the usage header, with nothing yet spent",
+        initial.day === 0 && initial.hour === 0 && initial.trial === 0, JSON.stringify(initial));
+  check("and the caps the record was written with",
+        initial["day-cap"] === 10 && initial["hour-cap"] === 10 && initial["trial-cap"] === 10,
+        JSON.stringify(initial));
+  check("reset seconds are bounded, as on an answer",
+        initial["day-resets"] > 0 && initial["day-resets"] <= 86400 &&
+        initial["hour-resets"] > 0 && initial["hour-resets"] <= 3600, JSON.stringify(initial));
+
+  // SAME SHAPE AS THE ANSWER'S HEADER, field for field. Otto has one parser;
+  // a registration header with a field the answer lacks, or vice versa, is
+  // the drift one shared function is there to prevent.
+  const first = await send({ ...env(kv), DB: makeDB(plan) }, valid, body.token);
+  const afterOne = parse(first);
+  check("the registration header has exactly the fields the answer's has",
+        JSON.stringify(Object.keys(initial).sort()) === JSON.stringify(Object.keys(afterOne).sort()),
+        `${Object.keys(initial)} vs ${Object.keys(afterOne)}`);
+  check("and the first answer counts from that zero", afterOne.trial === 1 && afterOne.day === 1,
+        JSON.stringify(afterOne));
+
+  // KV first, D1 second: a D1 failure still hands out a working trial.
+  const errors = [];
+  const realError = console.error;
+  console.error = (m) => errors.push(String(m));
+  const degraded = await register({ ...env(makeKV()), DB: makeDB(plan, { failInsert: true }) });
+  console.error = realError;
+  check("a D1 failure still issues a token and reports the trial",
+        degraded.status === 200 && parse(degraded)["trial-cap"] === 10);
+  check("and is logged without the token",
+        errors.some((e) => e.includes("device row not written")) &&
+        !errors.join("|").includes((await degraded.json()).token));
+}
+
 // ------------------------------------------------------------- validation
 
 console.log("deferring the counter write:");
