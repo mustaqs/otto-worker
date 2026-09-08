@@ -599,6 +599,27 @@ console.log("a leaked token is not a general Anthropic proxy:");
       { type: "image" }, { type: "image" }, { type: "image" }] }],
   }, "more images than allowed refused");
 
+  // THE BODY CAP IS ENFORCED, NOT DECLARED. It sat in wrangler.toml unread
+  // until Otto's A72. Both halves: a Content-Length that claims too much is
+  // refused before the body is read, and a body that IS too big is refused
+  // after, because the header is a claim. Under the cap, the same request
+  // passes validation (and then fails at the fake upstream, which is fine —
+  // 413 is what must not appear).
+  const small = { ...env(kv), MAX_BODY_BYTES: "1000" };
+  const big = await worker.fetch(ask({ ...valid, messages: [{ role: "user",
+    content: [{ type: "text", text: "x".repeat(2000) }] }] }), small);
+  check("a body over MAX_BODY_BYTES is refused with 413",
+        big.status === 413 && (await big.json()).error === "body_too_large", `got ${big.status}`);
+  const claimed = await worker.fetch(new Request("https://w/v1/ask", {
+    method: "POST",
+    headers: { authorization: `Bearer ${goodToken}`, "content-type": "application/json",
+               "content-length": "5000" },
+    body: JSON.stringify(valid) }), small);
+  check("a Content-Length over the cap is refused before the body is read",
+        claimed.status === 413, `got ${claimed.status}`);
+  const under = await worker.fetch(ask(valid), small).catch(() => ({ status: "threw" }));
+  check("a body under the cap is not refused for size", under.status !== 413, `got ${under.status}`);
+
   const r = await worker.fetch(new Request("https://w/v1/other", {
     method: "POST", headers: { authorization: `Bearer ${goodToken}` }, body: "{}" }), env(kv));
   check("unknown path refused", r.status === 404);

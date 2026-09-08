@@ -36,7 +36,10 @@ whether the answer is one line or ten. `MAX_OUTPUT_TOKENS` caps the other side.
 
 **A leaked token is not a general-purpose Anthropic proxy.** Model must be in
 the allowlist, `stream` must be true, `max_tokens` is capped, images are capped,
-and the body has a size limit.
+and the body is capped at `MAX_BODY_BYTES` — refused with `413 body_too_large`
+on the declared length and again on the bytes received. (The cap was declared
+from the first deploy and enforced from Otto's A72; a declared cap nothing reads
+is a comment.)
 
 **Revocation is a flag, not a key rotation.** Set `active: false` on the token
 record; the next request is refused. No redeploy, no effect on anyone else.

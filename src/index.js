@@ -85,9 +85,27 @@ export default {
     defer(ctx, gate.commit(), "counter increment");
     const afterKV = Date.now();
 
+    /*
+     * BOUNDED BEFORE IT IS PARSED. `MAX_BODY_BYTES` was declared in
+     * wrangler.toml from the first deploy and enforced nowhere — a declared cap
+     * that nothing reads is a comment. A question is a ~200KB body (one 1200px
+     * JPEG as base64 plus a few KB of text and, since Otto's A72, up to five
+     * remembered exchanges of plain text); the cap is thirty times that, so it
+     * bounds abuse rather than use. Checked on the declared length first, then
+     * on the bytes actually received, because Content-Length is a claim. The
+     * body is read as bytes and decoded once, so this adds no copy that
+     * `request.json()` was not already making. 413, and a code Otto's
+     * RelayError maps to "a bug in Otto" — the user cannot act on it.
+     */
+    const maxBody = Number(env.MAX_BODY_BYTES) || 6_000_000;
+    const declared = Number(request.headers.get("content-length"));
+    if (declared > maxBody) return problem(413, "body_too_large");
+
     let body;
     try {
-      body = await request.json();
+      const raw = await request.arrayBuffer();
+      if (raw.byteLength > maxBody) return problem(413, "body_too_large");
+      body = JSON.parse(new TextDecoder().decode(raw));
     } catch {
       return problem(400, "malformed_json");
     }
