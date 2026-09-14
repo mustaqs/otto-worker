@@ -799,12 +799,13 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
     const realLog = console.log, realError = console.error;
     console.log = (...a) => logged.push(a.join(" ")); console.error = (...a) => logged.push(a.join(" "));
     composioScript = { "POST /tools/execute/GMAIL_FETCH_EMAILS": async () => ({ status: 200, json: { successful: true, data: {
-      messages: [{ sender: "alice@example.com", subject: "Lunch SECRETWORD", messageTimestamp: "2026-09-14T08:00:00Z", preview: "Are we still on?" }] } } }) };
+      messages: [{ sender: "alice@example.com", subject: "Lunch SECRETWORD", messageTimestamp: "2026-09-14T08:00:00Z", messageText: "", preview: { body: "Are we still on?", subject: "Lunch SECRETWORD" } }] } } }) };
     const r = await post("/v1/tool", deviceToken, { tool: "gmail_search", input: { query: "from:alice" }, now: "2026-09-14T09:00:00+05:30", tz: "Asia/Kolkata" });
     const j = await r.json();
     console.log = realLog; console.error = realError;
     check("a connected app's tool runs and answers ok", r.status === 200 && j.ok === true, JSON.stringify(j).slice(0, 120));
     check("the result is the compact shape, not Composio's", Array.isArray(j.result) && j.result[0].from === "alice@example.com" && j.result[0].subject.includes("Lunch") && !("messages" in j));
+    check("the snippet comes from preview.body, the live reply's shape", j.result[0].snippet === "Are we still on?" && j.result[0].date === "2026-09-14T08:00:00Z");
     const sent = calls.at(-1);
     check("Composio is asked under the account subject with the connected account and filled defaults",
           sent.body.user_id === accountId && sent.body.connected_account_id === "ca_test1234"

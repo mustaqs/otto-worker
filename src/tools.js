@@ -119,7 +119,11 @@ export function compact(tool, data) {
           from: firstOf(m, ["sender", "from"]),
           subject: firstOf(m, ["subject"]),
           date: firstOf(m, ["messageTimestamp", "date", "internalDate"]),
-          snippet: firstOf(m, ["preview", "snippet", "messageText"]).slice(0, 200),
+          // MEASURED on 2026-09-14 against a live reply: `preview` is an
+          // object holding `body` and `subject`, and `messageText` is empty
+          // with include_payload false. The first draft read `preview` as a
+          // string and every snippet came back blank.
+          snippet: (m && m.preview && typeof m.preview === "object" ? str(m.preview.body) : firstOf(m, ["snippet", "messageText"])).slice(0, 200),
         })),
         id: null,
       };

@@ -19,6 +19,7 @@ import {
 
 const ANTHROPIC = "https://api.anthropic.com/v1/messages";
 const COMPOSIO = "https://backend.composio.dev/api/v3.1";
+const COMPOSIO_TIMEOUT_MS = 20_000;
 
 /**
  * Set the first time this isolate handles a request. Workers spin down when
@@ -825,10 +826,14 @@ async function composio(env, method, path, body) {
   }
   let response;
   try {
+    // BOUNDED. A connector call that never returns would hold Otto's tool
+    // request open past the app's own deadline; twenty seconds is above any
+    // measured execute (about 1.1 to 1.4s) and below what a user waits.
     response = await fetch(`${COMPOSIO}${path}`, {
       method,
       headers: { "content-type": "application/json", "x-api-key": key },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(COMPOSIO_TIMEOUT_MS),
     });
   } catch (error) {
     // The class of the error, never its message: a transport error's string
