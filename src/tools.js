@@ -21,6 +21,9 @@ export const CLOUD_TOOLS = {
   gcal_create:  { app: "gcal",  slug: "GOOGLECALENDAR_CREATE_EVENT",  kind: "create" },
   slack_post:   { app: "slack", slug: "SLACK_SEND_MESSAGE",           kind: "write" },
   slack_read:   { app: "slack", slug: "SLACK_SEARCH_MESSAGES",        kind: "read" },
+  // Never listed to the model: Otto's own undo of a gcal_create, by the id
+  // the create returned (A76, decision 3 as approved).
+  gcal_delete:  { app: "gcal",  slug: "GOOGLECALENDAR_DELETE_EVENT",  kind: "delete" },
 };
 
 export const APPS = ["gmail", "gcal", "slack"];
@@ -91,6 +94,9 @@ export function composioArguments(tool, input, now, tz) {
         sort: "timestamp",
         sort_dir: "desc",
       };
+    case "gcal_delete":
+      if (!str(a.id)) return null;
+      return { event_id: str(a.id), calendar_id: "primary" };
     default:
       return null;
   }
@@ -135,6 +141,8 @@ export function compact(tool, data) {
       return { result: { created: true }, id: str(d.id) || str(d.event_id) || null };
     case "slack_post":
       return { result: { posted: true }, id: null };
+    case "gcal_delete":
+      return { result: { deleted: true }, id: null };
     case "slack_read": {
       const matches = d.messages && Array.isArray(d.messages.matches) ? d.messages.matches : [];
       return {

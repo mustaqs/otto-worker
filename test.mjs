@@ -664,6 +664,8 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
   check("slack_read searches the channel newest first, twenty by default",
         read.query === "in:#launch" && read.count === 20 && read.sort === "timestamp" && read.sort_dir === "desc");
   check("an unknown tool maps to nothing", composioArguments("mcp_search", {}, "", "UTC") === null);
+  check("gcal_delete needs the id the create returned", composioArguments("gcal_delete", {}, "", "UTC") === null
+        && composioArguments("gcal_delete", { id: "evt_1" }, "", "UTC").event_id === "evt_1");
 
   // Two devices: a trial with nothing behind it, and one bound to an account.
   const trialToken = "trial-for-tools";
