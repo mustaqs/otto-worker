@@ -41,3 +41,12 @@ MAX_BODY_BYTES = "6000000"
 # real protection against a runaway bill.
 MAX_OUTPUT_TOKENS = "16384"
 MAX_IMAGES = "2"
+# Connected apps (SPEC.md A76). These are the ids of Composio's MANAGED auth
+# configs for Otto's project — identifiers, not secrets; the key is
+# COMPOSIO_API_KEY and the webhook's is COMPOSIO_WEBHOOK_SECRET, both set with
+# `wrangler secret put` and each read in exactly one function
+# (Bench/check-tool-path.sh). Managed means Composio's own Google and Slack
+# apps: Otto registers nothing with either vendor.
+COMPOSIO_AUTH_CONFIG_GMAIL = "ac_xPpwCkJpxBXc"
+COMPOSIO_AUTH_CONFIG_GCAL = "ac_AJQbYqHNfIx7"
+COMPOSIO_AUTH_CONFIG_SLACK = "ac_vU_uV6PGnq2I"
