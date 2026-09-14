@@ -639,5 +639,249 @@ console.log("nothing about a request is retained:");
         [...kv.store.keys()].every((k) => k.startsWith("u:") || k.startsWith("token:")));
 }
 
+
+// --------------------------------------------------------- connected apps
+
+console.log("connected apps (A76): a tool call, connect, callback, webhook — never the question path:");
+{
+  const { endOfDay, naive, composioArguments } = await import("./src/tools.js");
+
+  // The pure mapping, first: defaults are computed in the user's day.
+  check("endOfDay lands at 23:59:59 in the user's zone",
+        endOfDay("2026-09-14T09:12:00+05:30", "Asia/Kolkata") === "2026-09-14T23:59:59+05:30",
+        endOfDay("2026-09-14T09:12:00+05:30", "Asia/Kolkata"));
+  check("naive strips the offset and keeps the wall-clock time",
+        naive("2026-09-14T15:00:00+05:30") === "2026-09-14T15:00:00" && naive("2026-09-14T09:30:00Z") === "2026-09-14T09:30:00");
+  const create = composioArguments("gcal_create", { title: "Standup", start: "2026-09-15T10:00:00+05:30", minutes: 90, attendees: "a@x.com, b@x.com" }, "2026-09-14T09:12:00+05:30", "Asia/Kolkata");
+  check("gcal_create splits 90 minutes into an hour and thirty, names the zone, invites and notifies",
+        create.event_duration_hour === 1 && create.event_duration_minutes === 30 && create.timezone === "Asia/Kolkata"
+        && create.start_datetime === "2026-09-15T10:00:00" && create.attendees.length === 2 && create.send_updates === "all");
+  const search = composioArguments("gmail_search", {}, "2026-09-14T09:12:00Z", "UTC");
+  check("gmail_search with nothing said means the inbox, five messages, metadata only",
+        search.query === "in:inbox" && search.max_results === 5 && search.verbose === false && search.include_payload === false);
+  check("gmail_search clamps max to ten", composioArguments("gmail_search", { max: 99 }, "", "UTC").max_results === 10);
+  const read = composioArguments("slack_read", { channel: "#launch" }, "", "UTC");
+  check("slack_read searches the channel newest first, twenty by default",
+        read.query === "in:#launch" && read.count === 20 && read.sort === "timestamp" && read.sort_dir === "desc");
+  check("an unknown tool maps to nothing", composioArguments("mcp_search", {}, "", "UTC") === null);
+  check("gcal_delete needs the id the create returned", composioArguments("gcal_delete", {}, "", "UTC") === null
+        && composioArguments("gcal_delete", { id: "evt_1" }, "", "UTC").event_id === "evt_1");
+
+  // Two devices: a trial with nothing behind it, and one bound to an account.
+  const trialToken = "trial-for-tools";
+  const deviceToken = "device-for-tools";
+  const accountId = "acct-0000-1111";
+  const kv = makeKV({
+    [`token:${trialToken}`]: JSON.stringify({ v: 2, subject: trialToken, kind: "trial", plan: "trial", active: true, dailyCap: 10, hourlyCap: 10, trialCap: 10 }),
+    [`token:${deviceToken}`]: JSON.stringify({ v: 2, subject: accountId, kind: "device", plan: "free", active: true, dailyCap: 50, hourlyCap: 20, trialCap: 0 }),
+  });
+  const plans = { free: { name: "free", daily_cap: 50, hourly_cap: 20, trial_cap: 0, tool_cap: 2 } };
+
+  // A D1 stand-in that keeps integration rows.
+  const rows = [];
+  const db = {
+    rows,
+    prepare: (sql) => ({ bind: (...args) => {
+      const q = sql.replace(/\s+/g, " ").trim();
+      return {
+        first: async () => {
+          if (q.includes("FROM plans")) return plans[args[0]] || null;
+          if (q.includes("FROM integrations WHERE connected_account_id")) return rows.find((r) => r.connected_account_id === args[0]) || null;
+          return null;
+        },
+        all: async () => ({ results: q.includes("FROM integrations WHERE account_id") ? rows.filter((r) => r.account_id === args[0]) : [] }),
+        run: async () => {
+          if (q.startsWith("INSERT INTO integrations")) {
+            const [account_id, app, connected_account_id, state, updated_at] = args;
+            const existing = rows.find((r) => r.account_id === account_id && r.app === app);
+            if (existing) Object.assign(existing, { connected_account_id, state, updated_at });
+            else rows.push({ account_id, app, connected_account_id, state, updated_at });
+          } else if (q.startsWith("UPDATE integrations SET state = ?, updated_at = ? WHERE account_id")) {
+            const r = rows.find((r) => r.account_id === args[2] && r.app === args[3]); if (r) r.state = args[0];
+          } else if (q.startsWith("UPDATE integrations SET state = 'expired'")) {
+            const r = rows.find((r) => r.connected_account_id === args[1]); if (r) r.state = "expired";
+          } else if (q.startsWith("DELETE FROM integrations")) {
+            const i = rows.findIndex((r) => r.account_id === args[0] && r.app === args[1]); if (i >= 0) rows.splice(i, 1);
+          }
+        },
+      };
+    } }),
+  };
+
+  // A fetch that plays Composio from a script and records every call.
+  const calls = [];
+  let composioScript = {};
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u.startsWith("https://backend.composio.dev/")) {
+      calls.push({ url: u, method: init.method || "GET", headers: init.headers || {}, body: init.body ? JSON.parse(init.body) : null });
+      const key = `${init.method || "GET"} ${u.replace("https://backend.composio.dev/api/v3.1", "")}`;
+      const handler = composioScript[key] || composioScript["*"];
+      const reply = handler ? await handler(init) : { status: 404, json: {} };
+      return new Response(JSON.stringify(reply.json), { status: reply.status });
+    }
+    return anthropicEmpty();
+  };
+  const anthropicEmpty = () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
+
+  const envTools = { ...env(kv), DB: db, COMPOSIO_API_KEY: ["ak", "TESTKEY-not-real"].join("_"),
+                     COMPOSIO_WEBHOOK_SECRET: "whsec-test-secret",
+                     COMPOSIO_AUTH_CONFIG_GMAIL: "ac_gmail", COMPOSIO_AUTH_CONFIG_GCAL: "ac_gcal", COMPOSIO_AUTH_CONFIG_SLACK: "ac_slack" };
+  const post = (path, token, body) => worker.fetch(new Request(`https://w${path}`, {
+    method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify(body) }), envTools);
+
+  // A trial has no account, and is told so before anything is looked up.
+  {
+    const r = await post("/v1/tool", trialToken, { tool: "gmail_search", input: {}, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    check("a trial device is refused a cloud tool with needs_account", r.status === 403 && (await r.json()).error === "needs_account");
+    const s = await post("/v1/integrations", trialToken, {});
+    check("a trial device sees every app unconnected and no account", s.status === 200 && (await s.json()).account === false);
+    check("nothing reached Composio for the trial", calls.length === 0);
+  }
+
+  // Nothing connected yet: needs_signin names the app, and the header says none.
+  {
+    const r = await post("/v1/tool", deviceToken, { tool: "gmail_search", input: {}, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    const j = await r.json();
+    check("an unconnected app answers needs_signin naming the app", r.status === 403 && j.error === "needs_signin" && j.app === "gmail");
+    check("the reply carries every cloud app's state", r.headers.get("otto-integrations") === "gmail=none;gcal=none;slack=none");
+    check("nothing reached Composio for an unconnected app", calls.length === 0);
+  }
+
+  // Connect: the link is Composio's, the row is pending, the callback makes it active.
+  {
+    composioScript = { "POST /connected_accounts/link": async () => ({ status: 201, json: { redirect_url: "https://connect.composio.dev/link/lk_test", connected_account_id: "ca_test1234" } }) };
+    const r = await post("/v1/integrations/link", deviceToken, { app: "gmail" });
+    const j = await r.json();
+    check("connect returns Composio's hosted link", r.status === 200 && j.url === "https://connect.composio.dev/link/lk_test");
+    const sent = calls.at(-1);
+    check("the link is asked for under the account subject, the managed config and the Worker's callback",
+          sent && sent.body.user_id === accountId && sent.body.auth_config_id === "ac_gmail"
+          && sent.body.callback_url === "https://w/v1/integrations/callback");
+    check("the key travels as x-api-key and never as a bearer", sent && sent.headers["x-api-key"] && !sent.headers.authorization);
+    check("the row is pending until the browser comes back", rows.some((r) => r.app === "gmail" && r.state === "pending"));
+    check("a trial cannot ask for a link", (await post("/v1/integrations/link", trialToken, { app: "gmail" })).status === 403);
+    check("an unknown app is refused", (await post("/v1/integrations/link", deviceToken, { app: "notion" })).status === 400);
+
+    composioScript = { "GET /connected_accounts/ca_test1234": async () => ({ status: 200, json: { id: "ca_test1234", status: "ACTIVE", user_id: accountId } }) };
+    const cb = await worker.fetch(new Request("https://w/v1/integrations/callback?status=success&connected_account_id=ca_test1234"), envTools);
+    check("the callback page says the one thing the user needs", cb.status === 200 && (await cb.text()).includes("return to Otto"));
+    check("the row is active once Composio confirms it", rows.some((r) => r.app === "gmail" && r.state === "active"));
+    const stranger = await worker.fetch(new Request("https://w/v1/integrations/callback?connected_account_id=ca_nobody99"), envTools);
+    check("an id this Worker never issued a link for is not accepted", stranger.status === 400);
+    check("a GET anywhere else is still refused", (await worker.fetch(new Request("https://w/v1/ask"), envTools)).status === 405);
+  }
+
+  // A connect the browser never finished: within the link's life the page
+  // says connecting; past it, the page says none and Connect mints afresh.
+  {
+    composioScript = { "POST /connected_accounts/link": async () => ({ status: 201, json: { redirect_url: "https://connect.composio.dev/link/lk_slack", connected_account_id: "ca_slack0001" } }) };
+    await post("/v1/integrations/link", deviceToken, { app: "slack" });
+    const fresh = await post("/v1/integrations", deviceToken, {});
+    check("a pending connect within ten minutes reads as pending", (await fresh.json()).apps.slack === "pending"
+          && fresh.headers.get("otto-integrations").includes("slack=pending"));
+    rows.find((r) => r.app === "slack").updated_at = Date.now() - 11 * 60 * 1000;
+    const stale = await post("/v1/integrations", deviceToken, {});
+    check("a pending connect older than ten minutes reads as none", (await stale.json()).apps.slack === "none"
+          && stale.headers.get("otto-integrations").includes("slack=none"));
+    check("the row itself is kept for a late callback", rows.find((r) => r.app === "slack").state === "pending");
+    const tool = await post("/v1/tool", deviceToken, { tool: "slack_post", input: { channel: "x", text: "y" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    check("a tool on a pending app is needs_signin either way", tool.status === 403 && (await tool.json()).error === "needs_signin");
+    composioScript = { "DELETE /connected_accounts/ca_slack0001": async () => ({ status: 200, json: {} }) };
+    const cancelled = await post("/v1/integrations/unlink", deviceToken, { app: "slack" });
+    check("cancel is an unlink: the pending row goes and the page says none", cancelled.status === 200 && !rows.some((r) => r.app === "slack"));
+  }
+
+  // A tool call: defaults filled, the reply compacted, the words kept out of KV and the log.
+  {
+    const logged = [];
+    const realLog = console.log, realError = console.error;
+    console.log = (...a) => logged.push(a.join(" ")); console.error = (...a) => logged.push(a.join(" "));
+    composioScript = { "POST /tools/execute/GMAIL_FETCH_EMAILS": async () => ({ status: 200, json: { successful: true, data: {
+      messages: [{ sender: "alice@example.com", subject: "Lunch SECRETWORD", messageTimestamp: "2026-09-14T08:00:00Z", messageText: "", preview: { body: "Are we still on?", subject: "Lunch SECRETWORD" } }] } } }) };
+    const r = await post("/v1/tool", deviceToken, { tool: "gmail_search", input: { query: "from:alice" }, now: "2026-09-14T09:00:00+05:30", tz: "Asia/Kolkata" });
+    const j = await r.json();
+    console.log = realLog; console.error = realError;
+    check("a connected app's tool runs and answers ok", r.status === 200 && j.ok === true, JSON.stringify(j).slice(0, 120));
+    check("the result is the compact shape, not Composio's", Array.isArray(j.result) && j.result[0].from === "alice@example.com" && j.result[0].subject.includes("Lunch") && !("messages" in j));
+    check("the snippet comes from preview.body, the live reply's shape", j.result[0].snippet === "Are we still on?" && j.result[0].date === "2026-09-14T08:00:00Z");
+    const sent = calls.at(-1);
+    check("Composio is asked under the account subject with the connected account and filled defaults",
+          sent.body.user_id === accountId && sent.body.connected_account_id === "ca_test1234"
+          && sent.body.arguments.query === "from:alice" && sent.body.arguments.max_results === 5 && sent.body.arguments.verbose === false);
+    check("the reply carries the states, now with gmail active", r.headers.get("otto-integrations") === "gmail=active;gcal=none;slack=none");
+    const stored = [...kv.store.entries()].map(([k, v]) => k + "=" + v).join("\n");
+    check("nothing of the arguments or the result reaches KV", !stored.includes("alice") && !stored.includes("SECRETWORD"));
+    check("nothing of the arguments or the result reaches the log", !logged.join("\n").includes("alice") && !logged.join("\n").includes("SECRETWORD"));
+    check("the tool counter was written for the day", [...kv.store.keys()].some((k) => k.startsWith(`u:${accountId}:t:`)));
+
+    // The cap: the plan allows two a day; the third is refused before Composio.
+    const before = calls.length;
+    await post("/v1/tool", deviceToken, { tool: "gmail_search", input: {}, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    const third = await post("/v1/tool", deviceToken, { tool: "gmail_search", input: {}, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    check("the plan's tool cap refuses the call past it", third.status === 429 && (await third.json()).error === "tool_limit");
+    check("a refused call never reaches Composio", calls.length === before + 1);
+    kv.store.delete([...kv.store.keys()].find((k) => k.startsWith(`u:${accountId}:t:`)));
+  }
+
+  // A lapsed authorization: the row is marked and Otto is told to sign in again.
+  {
+    composioScript = { "POST /tools/execute/GMAIL_SEND_EMAIL": async () => ({ status: 200, json: { successful: false, error: "Request failed with status 401 Unauthorized: invalid_grant" } }) };
+    const r = await post("/v1/tool", deviceToken, { tool: "gmail_send", input: { to: "bob@example.com", subject: "Hi", body: "Hello" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    const j = await r.json();
+    check("a lost authorization answers needs_signin", r.status === 403 && j.error === "needs_signin" && j.app === "gmail");
+    check("and the row is marked expired", rows.find((r) => r.app === "gmail").state === "expired");
+    check("the reply's header already says expired", r.headers.get("otto-integrations") === "gmail=expired;gcal=none;slack=none");
+    rows.find((r) => r.app === "gmail").state = "active";
+    composioScript = { "POST /tools/execute/GMAIL_SEND_EMAIL": async () => ({ status: 200, json: { successful: false, error: "Recipient address rejected" } }) };
+    const f = await post("/v1/tool", deviceToken, { tool: "gmail_send", input: { to: "bob@example.com", subject: "Hi", body: "Hello" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    check("an ordinary failure is tool_failed and does not touch the row", f.status === 502 && (await f.json()).error === "tool_failed" && rows.find((r) => r.app === "gmail").state === "active");
+  }
+
+  // The webhook: verified before parsed, and only the expiry event does anything.
+  {
+    const sign = async (id, ts, body, secret) => {
+      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${id}.${ts}.${body}`)));
+      return "v1," + btoa(String.fromCharCode(...mac));
+    };
+    const hook = async (body, { id = "msg_1", ts = String(Math.floor(Date.now() / 1000)), sig } = {}) =>
+      worker.fetch(new Request("https://w/v1/integrations/webhook", { method: "POST",
+        headers: { "webhook-id": id, "webhook-timestamp": ts, "webhook-signature": sig ?? await sign(id, ts, body, "whsec-test-secret"), "content-type": "application/json" },
+        body }), envTools);
+    const expired = JSON.stringify({ type: "composio.connected_account.expired", data: { id: "ca_test1234", status: "EXPIRED" } });
+    const bad = await hook(expired, { sig: "v1,AAAA" });
+    check("a wrong signature is refused", bad.status === 401 && rows.find((r) => r.app === "gmail").state === "active");
+    const stale = await hook(expired, { ts: String(Math.floor(Date.now() / 1000) - 900) });
+    check("a stale timestamp is refused even with a valid signature", stale.status === 401);
+    const good = await hook(expired);
+    check("a signed expiry event marks the row expired", good.status === 200 && rows.find((r) => r.app === "gmail").state === "expired");
+    const other = await hook(JSON.stringify({ type: "composio.trigger.message", data: { id: "x" } }));
+    check("any other event is acknowledged and ignored", other.status === 200);
+    const garbage = await hook("not json");
+    check("a signed body that is not JSON is a 400", garbage.status === 400);
+  }
+
+  // Disconnect: Composio's authorization deleted, the row gone.
+  {
+    composioScript = { "DELETE /connected_accounts/ca_test1234": async () => ({ status: 200, json: {} }) };
+    const r = await post("/v1/integrations/unlink", deviceToken, { app: "gmail" });
+    check("disconnect answers with the remaining states", r.status === 200 && r.headers.get("otto-integrations") === "gmail=none;gcal=none;slack=none");
+    check("the authorization was deleted at Composio", calls.at(-1).method === "DELETE" && calls.at(-1).url.endsWith("/connected_accounts/ca_test1234"));
+    check("and the row is gone", !rows.some((r) => r.app === "gmail"));
+  }
+
+  // A question never touches any of this: the same env, the question path,
+  // and Composio is not called.
+  {
+    const before = calls.length;
+    await send(envTools, valid, deviceToken);
+    check("a question makes no Composio call", calls.length === before);
+  }
+
+  globalThis.fetch = async () => anthropicEmpty();
+}
+
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

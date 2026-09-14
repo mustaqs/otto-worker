@@ -152,6 +152,44 @@ mirroring the one hand-set v1 record) for a baked v1 token that signs in, so an
 existing tester keeps their caps (D2). Both rows come from
 `migrations/0002_stage2_plans.sql`.
 
+## Connected apps (A76)
+
+Six routes, none of them the question path. A cloud tool is one Composio
+call; the Worker holds `COMPOSIO_API_KEY` (one reader, `composio()`) and, in
+D1, which apps an account connected and Composio's id for each authorization.
+The authorization itself lives at Composio. Tool arguments and results pass
+through the isolate for one request and are never logged, counted or stored.
+
+    POST /v1/tool                  { tool, input, now, tz } → 200 { ok, result, id } + otto-integrations
+    POST /v1/integrations          {}                       → 200 { apps, account } + otto-integrations
+    POST /v1/integrations/link     { app }                  → 200 { url }
+    GET  /v1/integrations/callback ?connected_account_id=…  → a page: "Connected. You can return to Otto."
+    POST /v1/integrations/unlink   { app }                  → 200 {} + otto-integrations
+    POST /v1/integrations/webhook  (signed by Composio)     → 200 {}
+
+`otto-integrations` is `gmail=active;gcal=none;slack=expired` — every cloud
+app's state, on every tool reply, so Otto's snapshot is refreshed by requests
+it already makes. Refusals: `needs_account` for a trial device, `needs_signin`
+with `app` when nothing is connected or the authorization has lapsed,
+`tool_limit` past the plan's `tool_cap` (zero means no gate; `free` is 20 a
+day, `beta` unlimited), `tool_failed` with a one-word `reason`.
+
+Setup, all out of band:
+
+    wrangler secret put COMPOSIO_API_KEY          # the project key, ak_…
+    wrangler secret put COMPOSIO_WEBHOOK_SECRET   # from Composio's webhook subscription
+    wrangler d1 migrations apply otto --remote    # 0003_integrations.sql
+
+The three `COMPOSIO_AUTH_CONFIG_*` entries in `[vars]` are the ids of the
+managed auth configs in Otto's Composio project — identifiers, not secrets.
+The webhook URL to give Composio is `https://<worker>/v1/integrations/callback`'s
+sibling, `/v1/integrations/webhook`; deliveries are verified as HMAC-SHA256 over
+`webhook-id.webhook-timestamp.body` within five minutes, before the body is
+parsed. `Bench/check-tool-path.sh` asserts the single readers, the verify-before-
+parse order, that no tool route reaches Supabase, that no log line interpolates
+arguments or results, and that `src/tools.js` — the mapping from Otto's ten
+slim tools to Composio's actions — is pure.
+
 ## Tests
 
     node test.mjs

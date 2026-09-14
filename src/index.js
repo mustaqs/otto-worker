@@ -12,7 +12,14 @@
  * proof of deployed source, and Otto's privacy page says so.
  */
 
+import {
+  CLOUD_TOOLS, APPS, composioArguments, compact, integrationsHeader,
+  looksLikeLostAuthorization, verifyWebhookSignature,
+} from "./tools.js";
+
 const ANTHROPIC = "https://api.anthropic.com/v1/messages";
+const COMPOSIO = "https://backend.composio.dev/api/v3.1";
+const COMPOSIO_TIMEOUT_MS = 20_000;
 
 /**
  * Set the first time this isolate handles a request. Workers spin down when
@@ -34,8 +41,14 @@ export default {
     const cold = !isolateWarm;
     isolateWarm = true;
 
-    if (request.method !== "POST") return problem(405, "method_not_allowed");
     const url = new URL(request.url);
+
+    // THE ONE GET: the browser lands here after a connect. Everything else is
+    // POST, and the 405 below still covers it.
+    if (request.method === "GET" && url.pathname === "/v1/integrations/callback") {
+      return integrationsCallback(request, env);
+    }
+    if (request.method !== "POST") return problem(405, "method_not_allowed");
 
     // Registration is a separate route on purpose, and it is the ONLY other one.
     // Everything the question path needs is below; nothing it calls reaches D1
@@ -46,6 +59,14 @@ export default {
     // NOT the question path. Supabase is reached from these and nowhere else.
     if (url.pathname === "/v1/signin") return signInStart(request, env);
     if (url.pathname === "/v1/signin/verify") return signInVerify(request, env);
+    // Connected apps (A76): a tool call, the page's status, connect, disconnect,
+    // and Composio's webhook. D1 and Composio are reached from these and never
+    // from the question path — Bench/check-tool-path.sh.
+    if (url.pathname === "/v1/tool") return runTool(request, env);
+    if (url.pathname === "/v1/integrations") return integrationsStatus(request, env);
+    if (url.pathname === "/v1/integrations/link") return integrationsLink(request, env);
+    if (url.pathname === "/v1/integrations/unlink") return integrationsUnlink(request, env);
+    if (url.pathname === "/v1/integrations/webhook") return integrationsWebhook(request, env);
 
     if (url.pathname !== "/v1/ask") return problem(404, "not_found");
 
@@ -774,6 +795,386 @@ async function findOrCreateAccount(env, user, plan) {
      VALUES (?, ?, ?, ?, ?)`
   ).bind(id, user.email, user.id, plan, Date.now()).run();
   return { id, plan };
+}
+
+// ---------------------------------------------------------- connected apps
+
+/**
+ * Connected apps: Gmail, Google Calendar and Slack through Composio (SPEC.md
+ * A76). Five routes plus the browser callback, and NONE OF THEM IS THE
+ * QUESTION PATH — a question still touches KV and Anthropic and nothing else.
+ *
+ * WHAT THE WORKER HOLDS: `COMPOSIO_API_KEY`, read in exactly one function
+ * (`composio`); `COMPOSIO_WEBHOOK_SECRET`, read in one; and, in D1, which apps
+ * an account connected and Composio's id for each authorization. The
+ * authorization itself lives at Composio. Tool arguments and results pass
+ * through this isolate for the length of one request and are not logged,
+ * counted or stored; the log names the tool and the outcome and never the
+ * words.
+ *
+ * WHO A CLOUD TOOL BELONGS TO: the account subject — the same id the quota is
+ * keyed on — never the email. A trial device has no account and is refused
+ * with `needs_account` before anything is looked up.
+ */
+
+/** One call to Composio. THE ONLY READER OF THE KEY. */
+async function composio(env, method, path, body) {
+  const key = env.COMPOSIO_API_KEY;   // read once; the only read in this file
+  if (!key) {
+    console.error("connected apps are not provisioned: COMPOSIO_API_KEY is missing");
+    return { unavailable: true };
+  }
+  let response;
+  try {
+    // BOUNDED. A connector call that never returns would hold Otto's tool
+    // request open past the app's own deadline; twenty seconds is above any
+    // measured execute (about 1.1 to 1.4s) and below what a user waits.
+    response = await fetch(`${COMPOSIO}${path}`, {
+      method,
+      headers: { "content-type": "application/json", "x-api-key": key },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(COMPOSIO_TIMEOUT_MS),
+    });
+  } catch (error) {
+    // The class of the error, never its message: a transport error's string
+    // form can carry the request, and the request carries the arguments.
+    console.error(`connector unreachable at ${method} ${path.split("?")[0]} (${error && error.name ? error.name : "error"})`);
+    return { unavailable: true };
+  }
+  let json = null;
+  try { json = await response.json(); } catch { json = null; }
+  return { status: response.status, json };
+}
+
+/**
+ * The account's rows, for the header and the page.
+ *
+ * A PENDING ROW OLDER THAN THE LINK IS REPORTED AS NONE. Composio's hosted
+ * link lives ten minutes; a connect the browser never finished would
+ * otherwise read "connecting" on every open with no exit. The row itself is
+ * kept — a late callback can still make it active — but what Otto is told is
+ * that there is nothing to wait for. A comparison at read time, no timer.
+ */
+const PENDING_LIFETIME_MS = 10 * 60 * 1000;
+
+async function integrationRows(env, accountId, now = Date.now()) {
+  const result = await env.DB.prepare(
+    `SELECT app, connected_account_id, state, updated_at FROM integrations WHERE account_id = ?`
+  ).bind(accountId).all();
+  const rows = (result && result.results) || [];
+  return rows.map((row) =>
+    row.state === "pending" && now - Number(row.updated_at || 0) > PENDING_LIFETIME_MS
+      ? { ...row, state: "none" }
+      : row);
+}
+
+/** A bearer with an account behind it, or the refusal that says why not. */
+async function authenticateAccount(request, env) {
+  const auth = await authenticate(request, env);
+  if (auth.refused) return auth;
+  if (auth.account.kind !== "device") return { refused: problem(403, "needs_account") };
+  return auth;
+}
+
+/**
+ * POST /v1/tool  { tool, input, now, tz }  →  200 { ok: true, result, id } + otto-integrations
+ *
+ * One tool, one Composio call. In order: the bearer must have an account; the
+ * tool must be one of Otto's cloud tools; the tool counter must be under the
+ * plan's cap; the app must be connected; then Composio runs the action and
+ * the reply is compacted. A refused execute that looks like a lost
+ * authorization marks the row expired and answers `needs_signin`, which Otto
+ * speaks as "Gmail needs you to sign in again".
+ */
+async function runTool(request, env) {
+  const auth = await authenticateAccount(request, env);
+  if (auth.refused) return auth.refused;
+  const accountId = auth.account.subject;
+
+  let body;
+  try { body = await request.json(); } catch { return problem(400, "malformed_json"); }
+  const tool = body && typeof body.tool === "string" ? body.tool : "";
+  const spec = CLOUD_TOOLS[tool];
+  if (!spec) return problem(400, "unknown_tool");
+  const now = body && typeof body.now === "string" ? body.now : new Date().toISOString();
+  const tz = body && typeof body.tz === "string" && body.tz ? body.tz : "UTC";
+  const args = composioArguments(tool, body.input, now, tz);
+  if (!args) return problem(400, "unknown_tool");
+
+  // The tool cap, from the plan row. Off the question path, so D1 is allowed
+  // here; zero means no gate, as for every other cap.
+  const plan = await loadPlanCaps(env, auth.account.plan);
+  const toolCap = plan ? Number(plan.tool_cap) || 0 : 0;
+  const toolKey = `u:${accountId}:t:${new Date().toISOString().slice(0, 10)}`;
+  const used = Number(await env.OTTO.get(toolKey)) || 0;
+  if (toolCap > 0 && used >= toolCap) return problem(429, "tool_limit");
+
+  let rows;
+  try { rows = await integrationRows(env, accountId); } catch (error) {
+    console.error("integration rows unreadable:", String(error && error.message));
+    return problem(503, "not_provisioned");
+  }
+  const headers = integrationsHeader(rows);
+  const row = rows.find((r) => r.app === spec.app);
+  if (!row || row.state !== "active") {
+    return problem(403, "needs_signin", { app: spec.app }, headers);
+  }
+
+  // Counted before the call, like questions: a failed call still counts.
+  await env.OTTO.put(toolKey, String(used + 1), { expirationTtl: 60 * 60 * 48 });
+
+  const reply = await composio(env, "POST", `/tools/execute/${spec.slug}`, {
+    user_id: accountId,
+    connected_account_id: row.connected_account_id,
+    arguments: args,
+  });
+  if (reply.unavailable) return problem(503, "tool_failed", { reason: "unreachable" }, headers);
+  const ok = reply.status === 200 && reply.json && reply.json.successful === true;
+  if (!ok) {
+    const error = reply.json && (reply.json.error || (reply.json.data && reply.json.data.error));
+    if (reply.status === 401 || reply.status === 403 || looksLikeLostAuthorization(error)) {
+      await markIntegration(env, accountId, spec.app, "expired");
+      console.error(`tool ${tool}: the ${spec.app} authorization has lapsed`);
+      return problem(403, "needs_signin", { app: spec.app },
+                     integrationsHeader(rows.map((r) => (r.app === spec.app ? { ...r, state: "expired" } : r))));
+    }
+    // The status, never the message: the message can quote the arguments.
+    console.error(`tool ${tool}: connector answered HTTP ${reply.status}, successful=${ok}`);
+    return problem(502, "tool_failed", { reason: "connector" }, headers);
+  }
+
+  const { result, id } = compact(tool, reply.json.data);
+  console.log(`tool ${tool} ran for ${spec.app}`);
+  return json200({ ok: true, result, id }, headers);
+}
+
+/** The plan row with its tool cap. Never called from the question path. */
+async function loadPlanCaps(env, name) {
+  try {
+    return await env.DB.prepare(
+      `SELECT name, daily_cap, hourly_cap, trial_cap, tool_cap FROM plans WHERE name = ?`
+    ).bind(name).first();
+  } catch (error) {
+    console.error("plan lookup failed:", String(error && error.message));
+    return null;
+  }
+}
+
+async function markIntegration(env, accountId, app, state, connectedAccountId) {
+  try {
+    if (connectedAccountId) {
+      await env.DB.prepare(
+        `INSERT INTO integrations (account_id, app, connected_account_id, state, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(account_id, app) DO UPDATE SET
+           connected_account_id = excluded.connected_account_id,
+           state = excluded.state, updated_at = excluded.updated_at`
+      ).bind(accountId, app, connectedAccountId, state, Date.now()).run();
+    } else {
+      await env.DB.prepare(
+        `UPDATE integrations SET state = ?, updated_at = ? WHERE account_id = ? AND app = ?`
+      ).bind(state, Date.now(), accountId, app).run();
+    }
+  } catch (error) {
+    console.error("integration row not written:", String(error && error.message));
+  }
+}
+
+/**
+ * POST /v1/integrations  →  200 { apps: { gmail, gcal, slack } } + otto-integrations
+ *
+ * Read when the Integrations page opens, and at no other time (decision 7).
+ */
+async function integrationsStatus(request, env) {
+  const auth = await authenticate(request, env);
+  if (auth.refused) return auth.refused;
+  if (auth.account.kind !== "device") {
+    return json200({ apps: Object.fromEntries(APPS.map((a) => [a, "none"])), account: false },
+                   integrationsHeader([]));
+  }
+  let rows;
+  try { rows = await integrationRows(env, auth.account.subject); } catch (error) {
+    console.error("integration rows unreadable:", String(error && error.message));
+    return problem(503, "not_provisioned");
+  }
+  const apps = Object.fromEntries(APPS.map((a) => [a, "none"]));
+  for (const row of rows) apps[row.app] = row.state;
+  return json200({ apps, account: true }, integrationsHeader(rows));
+}
+
+/**
+ * POST /v1/integrations/link  { app }  →  200 { url }
+ *
+ * Asks Composio for a hosted sign-in link for this account and app, under the
+ * managed auth config named in [vars], and records the pending row so the
+ * callback can recognise the authorization when the browser comes back. The
+ * link expires at Composio's ten minutes; Otto opens it at once.
+ */
+async function integrationsLink(request, env) {
+  const auth = await authenticateAccount(request, env);
+  if (auth.refused) return auth.refused;
+  let body;
+  try { body = await request.json(); } catch { return problem(400, "malformed_json"); }
+  const app = body && typeof body.app === "string" ? body.app : "";
+  if (!APPS.includes(app)) return problem(400, "unknown_app");
+
+  const authConfig = authConfigFor(env, app);
+  if (!authConfig) return problem(503, "not_provisioned");
+
+  const origin = new URL(request.url).origin;
+  const reply = await composio(env, "POST", "/connected_accounts/link", {
+    user_id: auth.account.subject,
+    auth_config_id: authConfig,
+    callback_url: `${origin}/v1/integrations/callback`,
+  });
+  if (reply.unavailable) return problem(503, "connector_unavailable");
+  const url = reply.json && typeof reply.json.redirect_url === "string" ? reply.json.redirect_url : null;
+  const connectedAccountId = reply.json && typeof reply.json.connected_account_id === "string"
+    ? reply.json.connected_account_id : null;
+  if (reply.status !== 201 && reply.status !== 200 || !url || !connectedAccountId) {
+    console.error(`connect link for ${app} refused: HTTP ${reply.status}`);
+    return problem(502, "connector_refused");
+  }
+  await markIntegration(env, auth.account.subject, app, "pending", connectedAccountId);
+  console.log(`connect link issued for ${app}`);
+  return json200({ url });
+}
+
+/** The managed auth config id for an app, from [vars]. Ids, not secrets. */
+function authConfigFor(env, app) {
+  switch (app) {
+    case "gmail": return env.COMPOSIO_AUTH_CONFIG_GMAIL || null;
+    case "gcal":  return env.COMPOSIO_AUTH_CONFIG_GCAL || null;
+    case "slack": return env.COMPOSIO_AUTH_CONFIG_SLACK || null;
+    default:      return null;
+  }
+}
+
+/**
+ * GET /v1/integrations/callback?status=…&connected_account_id=…
+ *
+ * The browser, after Composio's hosted sign-in. UNAUTHENTICATED, so nothing in
+ * the query is trusted: the id must match a pending row this Worker wrote,
+ * and Composio must report the account ACTIVE, before the row becomes active.
+ * Then a page that says the one thing the user needs.
+ */
+async function integrationsCallback(request, env) {
+  const url = new URL(request.url);
+  const id = url.searchParams.get("connected_account_id") || "";
+  let outcome = "not_found";
+  if (/^ca_[A-Za-z0-9_-]{4,}$/.test(id)) {
+    let row = null;
+    try {
+      row = await env.DB.prepare(
+        `SELECT account_id, app FROM integrations WHERE connected_account_id = ?`
+      ).bind(id).first();
+    } catch (error) {
+      console.error("integration row unreadable at callback:", String(error && error.message));
+    }
+    if (row) {
+      const reply = await composio(env, "GET", `/connected_accounts/${id}`);
+      const status = reply.json && typeof reply.json.status === "string" ? reply.json.status : "";
+      if (reply.status === 200 && status === "ACTIVE") {
+        await markIntegration(env, row.account_id, row.app, "active");
+        outcome = "connected";
+      } else {
+        outcome = status === "INITIATED" ? "pending" : "failed";
+      }
+      console.log(`connect callback for ${row.app}: ${outcome}`);
+    }
+  }
+  const sentence = {
+    connected: "Connected. You can return to Otto.",
+    pending: "Not finished yet. Close this and try Connect again in Otto.",
+    failed: "That didn't connect. Close this and try Connect again in Otto.",
+    not_found: "This link isn't one Otto is waiting for.",
+  }[outcome];
+  const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Otto</title>
+<style>body{font:17px/1.5 -apple-system,system-ui,sans-serif;color:#222;background:#f6f6f6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}main{padding:32px;text-align:center}</style>
+<main><p>${sentence}</p></main>`;
+  return new Response(html, {
+    status: outcome === "connected" ? 200 : 400,
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+/**
+ * POST /v1/integrations/unlink  { app }  →  200 {} + otto-integrations
+ *
+ * Deletes the authorization at Composio, then the row. Composio refusing does
+ * not keep the row: a user who clicked Disconnect gets a disconnected app.
+ */
+async function integrationsUnlink(request, env) {
+  const auth = await authenticateAccount(request, env);
+  if (auth.refused) return auth.refused;
+  let body;
+  try { body = await request.json(); } catch { return problem(400, "malformed_json"); }
+  const app = body && typeof body.app === "string" ? body.app : "";
+  if (!APPS.includes(app)) return problem(400, "unknown_app");
+  const accountId = auth.account.subject;
+
+  let rows = [];
+  try { rows = await integrationRows(env, accountId); } catch (error) {
+    console.error("integration rows unreadable:", String(error && error.message));
+  }
+  const row = rows.find((r) => r.app === app);
+  if (row) {
+    const reply = await composio(env, "DELETE", `/connected_accounts/${row.connected_account_id}`);
+    if (reply.unavailable || (reply.status !== 200 && reply.status !== 204 && reply.status !== 404)) {
+      console.error(`disconnect for ${app}: connector answered HTTP ${reply.status || "none"}`);
+    }
+    try {
+      await env.DB.prepare(`DELETE FROM integrations WHERE account_id = ? AND app = ?`)
+        .bind(accountId, app).run();
+    } catch (error) {
+      console.error("integration row not deleted:", String(error && error.message));
+    }
+  }
+  console.log(`disconnected ${app}`);
+  return json200({}, integrationsHeader(rows.filter((r) => r.app !== app)));
+}
+
+/**
+ * POST /v1/integrations/webhook  — Composio's events, signed.
+ *
+ * VERIFIED BEFORE IT IS PARSED: HMAC-SHA256 over id.timestamp.rawBody with the
+ * webhook secret, and a timestamp within five minutes. Only one event is acted
+ * on — a connected account expiring — and it sets one row's state. Everything
+ * else is acknowledged and dropped. The secret has exactly one reader.
+ */
+async function integrationsWebhook(request, env) {
+  const secret = env.COMPOSIO_WEBHOOK_SECRET;   // read once; the only read in this file
+  if (!secret) {
+    console.error("webhook is not provisioned: COMPOSIO_WEBHOOK_SECRET is missing");
+    return problem(503, "not_provisioned");
+  }
+  const raw = await request.text();
+  const verified = await verifyWebhookSignature({
+    id: request.headers.get("webhook-id"),
+    timestamp: request.headers.get("webhook-timestamp"),
+    signature: request.headers.get("webhook-signature"),
+    body: raw,
+    secret,
+  });
+  if (!verified) return problem(401, "bad_signature");
+
+  let event;
+  try { event = JSON.parse(raw); } catch { return problem(400, "malformed_json"); }
+  const type = event && typeof event.type === "string" ? event.type : "";
+  if (type === "composio.connected_account.expired") {
+    const id = event.data && typeof event.data.id === "string" ? event.data.id : "";
+    if (id) {
+      try {
+        await env.DB.prepare(
+          `UPDATE integrations SET state = 'expired', updated_at = ? WHERE connected_account_id = ?`
+        ).bind(Date.now(), id).run();
+      } catch (error) {
+        console.error("integration row not marked expired:", String(error && error.message));
+      }
+      console.log("a connected account expired; its row is marked");
+    }
+  }
+  return json200({});
 }
 
 // -------------------------------------------------------------- validation
