@@ -841,12 +841,26 @@ async function composio(env, method, path, body) {
   return { status: response.status, json };
 }
 
-/** The account's rows, for the header and the page. */
-async function integrationRows(env, accountId) {
+/**
+ * The account's rows, for the header and the page.
+ *
+ * A PENDING ROW OLDER THAN THE LINK IS REPORTED AS NONE. Composio's hosted
+ * link lives ten minutes; a connect the browser never finished would
+ * otherwise read "connecting" on every open with no exit. The row itself is
+ * kept — a late callback can still make it active — but what Otto is told is
+ * that there is nothing to wait for. A comparison at read time, no timer.
+ */
+const PENDING_LIFETIME_MS = 10 * 60 * 1000;
+
+async function integrationRows(env, accountId, now = Date.now()) {
   const result = await env.DB.prepare(
-    `SELECT app, connected_account_id, state FROM integrations WHERE account_id = ?`
+    `SELECT app, connected_account_id, state, updated_at FROM integrations WHERE account_id = ?`
   ).bind(accountId).all();
-  return (result && result.results) || [];
+  const rows = (result && result.results) || [];
+  return rows.map((row) =>
+    row.state === "pending" && now - Number(row.updated_at || 0) > PENDING_LIFETIME_MS
+      ? { ...row, state: "none" }
+      : row);
 }
 
 /** A bearer with an account behind it, or the refusal that says why not. */

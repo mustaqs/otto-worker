@@ -773,6 +773,26 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
     check("a GET anywhere else is still refused", (await worker.fetch(new Request("https://w/v1/ask"), envTools)).status === 405);
   }
 
+  // A connect the browser never finished: within the link's life the page
+  // says connecting; past it, the page says none and Connect mints afresh.
+  {
+    composioScript = { "POST /connected_accounts/link": async () => ({ status: 201, json: { redirect_url: "https://connect.composio.dev/link/lk_slack", connected_account_id: "ca_slack0001" } }) };
+    await post("/v1/integrations/link", deviceToken, { app: "slack" });
+    const fresh = await post("/v1/integrations", deviceToken, {});
+    check("a pending connect within ten minutes reads as pending", (await fresh.json()).apps.slack === "pending"
+          && fresh.headers.get("otto-integrations").includes("slack=pending"));
+    rows.find((r) => r.app === "slack").updated_at = Date.now() - 11 * 60 * 1000;
+    const stale = await post("/v1/integrations", deviceToken, {});
+    check("a pending connect older than ten minutes reads as none", (await stale.json()).apps.slack === "none"
+          && stale.headers.get("otto-integrations").includes("slack=none"));
+    check("the row itself is kept for a late callback", rows.find((r) => r.app === "slack").state === "pending");
+    const tool = await post("/v1/tool", deviceToken, { tool: "slack_post", input: { channel: "x", text: "y" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    check("a tool on a pending app is needs_signin either way", tool.status === 403 && (await tool.json()).error === "needs_signin");
+    composioScript = { "DELETE /connected_accounts/ca_slack0001": async () => ({ status: 200, json: {} }) };
+    const cancelled = await post("/v1/integrations/unlink", deviceToken, { app: "slack" });
+    check("cancel is an unlink: the pending row goes and the page says none", cancelled.status === 200 && !rows.some((r) => r.app === "slack"));
+  }
+
   // A tool call: defaults filled, the reply compacted, the words kept out of KV and the log.
   {
     const logged = [];
