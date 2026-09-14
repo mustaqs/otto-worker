@@ -320,6 +320,7 @@ console.log("sign-in (two requests, and neither is the question path):");
         first: async () => {
           const q = sql.trim();
           if (q.includes("FROM plans")) return plans[args[0]] || null;
+          if (q.includes("FROM integrations WHERE account_id = ? AND app")) return rows.find((r) => r.account_id === args[0] && r.app === args[1]) || null;
           if (q.includes("FROM accounts WHERE supabase_user_id")) return accounts.find((a) => a.supabase_user_id === args[0]) || null;
           if (q.includes("FROM accounts WHERE email")) return accounts.find((a) => a.email === args[0]) || null;
           return null;
@@ -686,6 +687,7 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
       return {
         first: async () => {
           if (q.includes("FROM plans")) return plans[args[0]] || null;
+          if (q.includes("FROM integrations WHERE account_id = ? AND app")) return rows.find((r) => r.account_id === args[0] && r.app === args[1]) || null;
           if (q.includes("FROM integrations WHERE connected_account_id")) return rows.find((r) => r.connected_account_id === args[0]) || null;
           return null;
         },
@@ -694,8 +696,12 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
           if (q.startsWith("INSERT INTO integrations")) {
             const [account_id, app, connected_account_id, state, updated_at] = args;
             const existing = rows.find((r) => r.account_id === account_id && r.app === app);
-            if (existing) Object.assign(existing, { connected_account_id, state, updated_at });
-            else rows.push({ account_id, app, connected_account_id, state, updated_at });
+            if (existing) Object.assign(existing, { connected_account_id, state, updated_at, connected_at: null, defaults: null });
+            else rows.push({ account_id, app, connected_account_id, state, updated_at, connected_at: null, defaults: null });
+          } else if (q.startsWith("UPDATE integrations SET state = 'active', updated_at = ?")) {
+            const [updated_at, connected_at, defaults, account_id, app] = args;
+            const r = rows.find((r) => r.account_id === account_id && r.app === app);
+            if (r) { r.state = "active"; r.updated_at = updated_at; r.connected_at = r.connected_at || connected_at; r.defaults = defaults; }
           } else if (q.startsWith("UPDATE integrations SET state = ?, updated_at = ? WHERE account_id")) {
             const r = rows.find((r) => r.account_id === args[2] && r.app === args[3]); if (r) r.state = args[0];
           } else if (q.startsWith("UPDATE integrations SET state = 'expired'")) {
@@ -726,7 +732,8 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
 
   const envTools = { ...env(kv), DB: db, COMPOSIO_API_KEY: ["ak", "TESTKEY-not-real"].join("_"),
                      COMPOSIO_WEBHOOK_SECRET: "whsec-test-secret",
-                     COMPOSIO_AUTH_CONFIG_GMAIL: "ac_gmail", COMPOSIO_AUTH_CONFIG_GCAL: "ac_gcal", COMPOSIO_AUTH_CONFIG_SLACK: "ac_slack" };
+                     COMPOSIO_AUTH_CONFIG_GMAIL: "ac_gmail", COMPOSIO_AUTH_CONFIG_GCAL: "ac_gcal", COMPOSIO_AUTH_CONFIG_SLACK: "ac_slack",
+                     COMPOSIO_AUTH_CONFIG_GITHUB: "ac_github", COMPOSIO_AUTH_CONFIG_JIRA: "ac_jira", COMPOSIO_AUTH_CONFIG_LINEAR: "ac_linear" };
   const post = (path, token, body) => worker.fetch(new Request(`https://w${path}`, {
     method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify(body) }), envTools);
@@ -745,7 +752,7 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
     const r = await post("/v1/tool", deviceToken, { tool: "gmail_search", input: {}, now: "2026-09-14T09:00:00Z", tz: "UTC" });
     const j = await r.json();
     check("an unconnected app answers needs_signin naming the app", r.status === 403 && j.error === "needs_signin" && j.app === "gmail");
-    check("the reply carries every cloud app's state", r.headers.get("otto-integrations") === "gmail=none;gcal=none;slack=none");
+    check("the reply carries every cloud app's state", r.headers.get("otto-integrations") === "gmail=none;gcal=none;slack=none;github=none;gitlab=none;jira=none;gdrive=none;notion=none;linear=none");
     check("nothing reached Composio for an unconnected app", calls.length === 0);
   }
 
@@ -762,7 +769,9 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
     check("the key travels as x-api-key and never as a bearer", sent && sent.headers["x-api-key"] && !sent.headers.authorization);
     check("the row is pending until the browser comes back", rows.some((r) => r.app === "gmail" && r.state === "pending"));
     check("a trial cannot ask for a link", (await post("/v1/integrations/link", trialToken, { app: "gmail" })).status === 403);
-    check("an unknown app is refused", (await post("/v1/integrations/link", deviceToken, { app: "notion" })).status === 400);
+    check("an unknown app is refused", (await post("/v1/integrations/link", deviceToken, { app: "dropbox" })).status === 400);
+    check("a wave-2 app with no auth config id yet is not_provisioned, not a broken link",
+          (await post("/v1/integrations/link", deviceToken, { app: "notion" })).status === 503);
 
     composioScript = { "GET /connected_accounts/ca_test1234": async () => ({ status: 200, json: { id: "ca_test1234", status: "ACTIVE", user_id: accountId } }) };
     const cb = await worker.fetch(new Request("https://w/v1/integrations/callback?status=success&connected_account_id=ca_test1234"), envTools);
@@ -810,7 +819,7 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
     check("Composio is asked under the account subject with the connected account and filled defaults",
           sent.body.user_id === accountId && sent.body.connected_account_id === "ca_test1234"
           && sent.body.arguments.query === "from:alice" && sent.body.arguments.max_results === 5 && sent.body.arguments.verbose === false);
-    check("the reply carries the states, now with gmail active", r.headers.get("otto-integrations") === "gmail=active;gcal=none;slack=none");
+    check("the reply carries the states, now with gmail active", r.headers.get("otto-integrations").startsWith("gmail=active;gcal=none;slack=none"));
     const stored = [...kv.store.entries()].map(([k, v]) => k + "=" + v).join("\n");
     check("nothing of the arguments or the result reaches KV", !stored.includes("alice") && !stored.includes("SECRETWORD"));
     check("nothing of the arguments or the result reaches the log", !logged.join("\n").includes("alice") && !logged.join("\n").includes("SECRETWORD"));
@@ -832,7 +841,7 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
     const j = await r.json();
     check("a lost authorization answers needs_signin", r.status === 403 && j.error === "needs_signin" && j.app === "gmail");
     check("and the row is marked expired", rows.find((r) => r.app === "gmail").state === "expired");
-    check("the reply's header already says expired", r.headers.get("otto-integrations") === "gmail=expired;gcal=none;slack=none");
+    check("the reply's header already says expired", r.headers.get("otto-integrations").startsWith("gmail=expired;gcal=none;slack=none"));
     rows.find((r) => r.app === "gmail").state = "active";
     composioScript = { "POST /tools/execute/GMAIL_SEND_EMAIL": async () => ({ status: 200, json: { successful: false, error: "Recipient address rejected" } }) };
     const f = await post("/v1/tool", deviceToken, { tool: "gmail_send", input: { to: "bob@example.com", subject: "Hi", body: "Hello" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
@@ -867,9 +876,85 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
   {
     composioScript = { "DELETE /connected_accounts/ca_test1234": async () => ({ status: 200, json: {} }) };
     const r = await post("/v1/integrations/unlink", deviceToken, { app: "gmail" });
-    check("disconnect answers with the remaining states", r.status === 200 && r.headers.get("otto-integrations") === "gmail=none;gcal=none;slack=none");
+    check("disconnect answers with the remaining states", r.status === 200 && r.headers.get("otto-integrations").startsWith("gmail=none;gcal=none;slack=none"));
     check("the authorization was deleted at Composio", calls.at(-1).method === "DELETE" && calls.at(-1).url.endsWith("/connected_accounts/ca_test1234"));
     check("and the row is gone", !rows.some((r) => r.app === "gmail"));
+  }
+
+  // ---- Wave 2 (A77): the mappings, the defaults at connect, the header's order.
+  {
+    const { composioArguments: args, compact, defaultsFromReplies, integrationsHeader, NeedsDetail, driveKind } = await import("./src/tools.js");
+    const gh = { login: "octocat" };
+    check("a bare GitHub repo is the user's own", (() => { const a = args("github_create_issue", { repo: "otto", title: "T" }, "", "UTC", gh); return a.owner === "octocat" && a.repo === "otto"; })());
+    check("owner/name is used as given", args("github_pull_requests", { repo: "acme/web" }, "", "UTC", gh).owner === "acme");
+    check("a bare repo with no login recorded needs a detail",
+          (() => { try { args("github_create_issue", { repo: "otto", title: "T" }, "", "UTC", null); return false; } catch (e) { return e instanceof NeedsDetail && e.hint === "repo"; } })());
+    check("my issues default to assigned, open, ten", (() => { const a = args("github_my_issues", {}, "", "UTC"); return a.filter === "assigned" && a.state === "open" && a.per_page === 10 && a.pulls === false; })());
+    const gl = { projects: [{ id: 7, name: "Otto Worker", path: "mustaqs/otto-worker" }] };
+    check("a bare GitLab project name matches the connection's projects", args("gitlab_create_issue", { project: "otto worker", title: "T" }, "", "UTC", gl).id === encodeURIComponent("mustaqs/otto-worker"));
+    check("a GitLab path is URL-encoded as the id", args("gitlab_merge_requests", { project: "group/sub/proj" }, "", "UTC", gl).id === "group%2Fsub%2Fproj");
+    check("merge requests are opened, all authors, newest updated", (() => { const a = args("gitlab_merge_requests", { project: "g/p" }, "", "UTC"); return a.state === "opened" && a.scope === "all" && a.order_by === "updated_at"; })());
+    const jr = { projects: [{ key: "OTT", name: "Otto" }, { key: "WEB", name: "Website" }] };
+    check("a Jira issue with no project goes to the first project", args("jira_create_issue", { title: "T" }, "", "UTC", jr).project_key === "OTT");
+    check("a Jira project by name resolves to its key", args("jira_create_issue", { title: "T", project: "website" }, "", "UTC", jr).project_key === "WEB");
+    check("a Jira key not in the list is used uppercased", args("jira_create_issue", { title: "T", project: "abc" }, "", "UTC", jr).project_key === "ABC");
+    check("a Jira issue with no project and no defaults needs a detail",
+          (() => { try { args("jira_create_issue", { title: "T" }, "", "UTC", null); return false; } catch (e) { return e instanceof NeedsDetail && e.hint === "project"; } })());
+    check("my Jira issues is the currentUser JQL, unresolved, newest updated", args("jira_my_issues", {}, "", "UTC").jql === "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC");
+    check("reported and a project narrow the JQL", args("jira_my_issues", { filter: "reported", project: "web" }, "", "UTC", jr).jql.startsWith('project = "WEB" AND reporter = currentUser()'));
+    check("a Drive query escapes quotes and excludes the trash", args("gdrive_find", { query: "Q3 plan's" }, "", "UTC").q === "name contains 'Q3 plan\\'s' and trashed = false");
+    check("a Drive doc is a Google Doc", args("gdrive_create_doc", { name: "N", text: "t" }, "", "UTC").mime_type === "application/vnd.google-apps.document");
+    check("a Notion append is one paragraph block", args("notion_append", { page_id: "p1", text: "hi" }, "", "UTC").content_blocks[0].content_block.content === "hi");
+    const ln = { user_id: "u1", teams: [{ id: "t1", key: "OTT", name: "Otto" }, { id: "t2", key: "WEB", name: "Web" }] };
+    check("a Linear issue with no team goes to the first team", args("linear_create_issue", { title: "T" }, "", "UTC", ln).team_id === "t1");
+    check("a Linear team by key or name resolves", args("linear_create_issue", { title: "T", team: "web" }, "", "UTC", ln).team_id === "t2");
+    check("my Linear issues are filtered to the connection's user", args("linear_my_issues", {}, "", "UTC", ln).assignee_id === "u1");
+    check("the undo tools need the id", args("jira_delete", {}, "", "UTC") === null && args("linear_archive", { id: "x" }, "", "UTC").issue_id === "x"
+          && args("gdrive_delete", { id: "f" }, "", "UTC").fileId === "f" && args("notion_archive", { id: "p" }, "", "UTC").archive === true);
+    check("compact keeps the issue key for undo and the number for the answer",
+          compact("jira_create_issue", { key: "OTT-9", id: "10001" }).id === "OTT-9" && compact("github_create_issue", { number: 12, html_url: "https://x" }).id === null);
+    check("compact reads a Notion search from response_data",
+          compact("notion_find_page", { response_data: { results: [{ id: "p1", properties: { Name: { type: "title", title: [{ plain_text: "Meeting" }] } }, last_edited_time: "2026-09-14T00:00:00Z", url: "https://n" }] } }).result[0].title === "Meeting");
+    check("compact names Drive kinds", driveKind("application/vnd.google-apps.spreadsheet") === "Google Sheet" && compact("gdrive_find", { files: [{ name: "a", mimeType: "application/pdf" }] }).result[0].kind === "PDF");
+    check("defaults from replies: GitHub login, Jira projects, Linear user and teams",
+          defaultsFromReplies("github", [{ login: "octocat" }]).login === "octocat"
+          && defaultsFromReplies("jira", [{ values: [{ key: "OTT", name: "Otto" }] }]).projects[0].key === "OTT"
+          && defaultsFromReplies("linear", [{ user: { id: "u1" } }, { items: [{ id: "t1", key: "OTT", name: "Otto" }] }]).teams[0].id === "t1");
+    check("the header lists connected apps oldest first, then the rest as none",
+          integrationsHeader([{ app: "slack", state: "active", connected_at: 300 }, { app: "gmail", state: "active", connected_at: 100 }, { app: "notion", state: "pending", updated_at: 200 }])["otto-integrations"]
+            === "gmail=active;notion=pending;slack=active;gcal=none;github=none;gitlab=none;jira=none;gdrive=none;linear=none");
+
+    // Connect GitHub: the callback runs the default lookup and stores the login.
+    composioScript = { "POST /connected_accounts/link": async () => ({ status: 201, json: { redirect_url: "https://connect.composio.dev/link/lk_gh", connected_account_id: "ca_github01" } }) };
+    const link = await post("/v1/integrations/link", deviceToken, { app: "github" });
+    check("a wave-2 app with an auth config id gets a link", link.status === 200);
+    check("the link request carries no connection_data (Jira tries without, decision 2)", !("connection_data" in calls.at(-1).body));
+    composioScript = {
+      "GET /connected_accounts/ca_github01": async () => ({ status: 200, json: { id: "ca_github01", status: "ACTIVE" } }),
+      "POST /tools/execute/GITHUB_GET_THE_AUTHENTICATED_USER": async () => ({ status: 200, json: { successful: true, data: { login: "octocat", name: "The Octocat" } } }),
+    };
+    const cb = await worker.fetch(new Request("https://w/v1/integrations/callback?status=success&connected_account_id=ca_github01"), envTools);
+    const ghRow = rows.find((r) => r.app === "github");
+    check("the callback activates the row and records the connect time", cb.status === 200 && ghRow.state === "active" && Number.isFinite(ghRow.connected_at));
+    check("and stores the defaults the lookup returned", ghRow.defaults && JSON.parse(ghRow.defaults).login === "octocat");
+    check("the lookup ran under the account and the connected account",
+          calls.at(-1).url.endsWith("/tools/execute/GITHUB_GET_THE_AUTHENTICATED_USER") && calls.at(-1).body.connected_account_id === "ca_github01" && calls.at(-1).body.user_id === accountId);
+
+    // A tool on it: the default fills the owner; a missing default is needs_detail.
+    // (The earlier block left the day's tool counter at the test plan's cap.)
+    for (const k of [...kv.store.keys()]) if (k.startsWith(`u:${accountId}:t:`)) kv.store.delete(k);
+    composioScript = { "POST /tools/execute/GITHUB_CREATE_AN_ISSUE": async () => ({ status: 200, json: { successful: true, data: { number: 42, html_url: "https://github.com/octocat/otto/issues/42" } } }) };
+    const issue = await post("/v1/tool", deviceToken, { tool: "github_create_issue", input: { repo: "otto", title: "Login button dead on Safari" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    const issueJson = await issue.json();
+    check("a GitHub issue is filed on the user's own repo from the recorded login", issue.status === 200 && issueJson.ok && calls.at(-1).body.arguments.owner === "octocat" && issueJson.result.number === 42 && issueJson.id === null);
+    // Gmail was disconnected above, so GitHub is the only row: first in the header, the rest none.
+    check("the header lists the connected app first and the rest as none", issue.headers.get("otto-integrations").startsWith("github=active;gmail=none;"));
+    ghRow.defaults = null;
+    const before = calls.length;
+    const vague = await post("/v1/tool", deviceToken, { tool: "github_create_issue", input: { repo: "otto", title: "T" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    check("without a recorded login a bare repo is needs_detail with the hint, before Composio", vague.status === 400 && (await vague.json()).hint === "repo" && calls.length === before);
+    composioScript = { "DELETE /connected_accounts/ca_github01": async () => ({ status: 200, json: {} }) };
+    await post("/v1/integrations/unlink", deviceToken, { app: "github" });
   }
 
   // A question never touches any of this: the same env, the question path,

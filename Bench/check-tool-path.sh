@@ -73,7 +73,7 @@ fi
 
 echo "connected apps — routes:"
 
-TOOL_FUNCS="runTool integrationsStatus integrationsLink integrationsCallback integrationsUnlink integrationsWebhook"
+TOOL_FUNCS="runTool integrationsStatus integrationsLink integrationsCallback integrationsUnlink integrationsWebhook activateIntegration connectDefaults"
 
 # FAILING EDIT: call supabase(env, ...) from runTool.
 for fn in $TOOL_FUNCS; do
@@ -115,7 +115,7 @@ echo "connected apps — no words in the log:"
 
 # FAILING EDIT: add `console.log(\`ran ${tool} with ${JSON.stringify(args)}\`)` to runTool.
 leaks=$(for fn in $TOOL_FUNCS composio; do body "$fn"; done \
-        | grep "console\." | grep -cE '\$\{[^}]*\b(args|input|result|body|raw|token|event|reply\.json)\b')
+        | grep "console\." | grep -cE '\$\{[^}]*\b(args|input|result|body|raw|token|event|reply\.json|defaults|replies)\b')
 [ "$leaks" = "0" ]
 check "no log line in the tool routes interpolates arguments, a result, a body or a token" $?
 

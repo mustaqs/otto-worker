@@ -15,6 +15,7 @@
 import {
   CLOUD_TOOLS, APPS, composioArguments, compact, integrationsHeader,
   looksLikeLostAuthorization, verifyWebhookSignature,
+  NeedsDetail, DEFAULT_LOOKUPS, defaultsFromReplies,
 } from "./tools.js";
 
 const ANTHROPIC = "https://api.anthropic.com/v1/messages";
@@ -859,7 +860,7 @@ const PENDING_LIFETIME_MS = 10 * 60 * 1000;
 
 async function integrationRows(env, accountId, now = Date.now()) {
   const result = await env.DB.prepare(
-    `SELECT app, connected_account_id, state, updated_at FROM integrations WHERE account_id = ?`
+    `SELECT app, connected_account_id, state, updated_at, connected_at, defaults FROM integrations WHERE account_id = ?`
   ).bind(accountId).all();
   const rows = (result && result.results) || [];
   return rows.map((row) =>
@@ -898,8 +899,6 @@ async function runTool(request, env) {
   if (!spec) return problem(400, "unknown_tool");
   const now = body && typeof body.now === "string" ? body.now : new Date().toISOString();
   const tz = body && typeof body.tz === "string" && body.tz ? body.tz : "UTC";
-  const args = composioArguments(tool, body.input, now, tz);
-  if (!args) return problem(400, "unknown_tool");
 
   // The tool cap, from the plan row. Off the question path, so D1 is allowed
   // here; zero means no gate, as for every other cap.
@@ -919,6 +918,20 @@ async function runTool(request, env) {
   if (!row || row.state !== "active") {
     return problem(403, "needs_signin", { app: spec.app }, headers);
   }
+
+  // The arguments, with the connection's defaults filled in (A77). A
+  // default the user never said and the row does not hold — which
+  // repository, project or team — is `needs_detail` with a hint Otto speaks.
+  let defaults = null;
+  try { defaults = row.defaults ? JSON.parse(row.defaults) : null; } catch { defaults = null; }
+  let args;
+  try {
+    args = composioArguments(tool, body.input, now, tz, defaults);
+  } catch (error) {
+    if (error instanceof NeedsDetail) return problem(400, "needs_detail", { hint: error.hint }, headers);
+    throw error;
+  }
+  if (!args) return problem(400, "unknown_tool", {}, headers);
 
   // Counted before the call, like questions: a failed call still counts.
   await env.OTTO.put(toolKey, String(used + 1), { expirationTtl: 60 * 60 * 48 });
@@ -964,11 +977,12 @@ async function markIntegration(env, accountId, app, state, connectedAccountId) {
   try {
     if (connectedAccountId) {
       await env.DB.prepare(
-        `INSERT INTO integrations (account_id, app, connected_account_id, state, updated_at)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO integrations (account_id, app, connected_account_id, state, updated_at, connected_at, defaults)
+         VALUES (?, ?, ?, ?, ?, NULL, NULL)
          ON CONFLICT(account_id, app) DO UPDATE SET
            connected_account_id = excluded.connected_account_id,
-           state = excluded.state, updated_at = excluded.updated_at`
+           state = excluded.state, updated_at = excluded.updated_at,
+           connected_at = NULL, defaults = NULL`
       ).bind(accountId, app, connectedAccountId, state, Date.now()).run();
     } else {
       await env.DB.prepare(
@@ -981,7 +995,50 @@ async function markIntegration(env, accountId, app, state, connectedAccountId) {
 }
 
 /**
- * POST /v1/integrations  →  200 { apps: { gmail, gcal, slack } } + otto-integrations
+ * The row becomes active: `connected_at` is set the first time only, so the
+ * header's order is the order of first connection, and the defaults are
+ * written (A77).
+ */
+async function activateIntegration(env, accountId, app, defaults) {
+  try {
+    await env.DB.prepare(
+      `UPDATE integrations SET state = 'active', updated_at = ?,
+         connected_at = COALESCE(connected_at, ?), defaults = ?
+       WHERE account_id = ? AND app = ?`
+    ).bind(Date.now(), Date.now(), defaults ? JSON.stringify(defaults) : null, accountId, app).run();
+  } catch (error) {
+    console.error("integration row not activated:", String(error && error.message));
+  }
+}
+
+/**
+ * The defaults for an app, from its lookups (tools.js says which). Null
+ * for an app with none, or when a lookup fails — logged by app and status,
+ * never by content.
+ */
+async function connectDefaults(env, app, accountId, connectedAccountId) {
+  const lookups = DEFAULT_LOOKUPS[app];
+  if (!lookups || !lookups.length) return null;
+  const replies = [];
+  for (const lookup of lookups) {
+    const reply = await composio(env, "POST", `/tools/execute/${lookup.slug}`, {
+      user_id: accountId,
+      connected_account_id: connectedAccountId,
+      arguments: lookup.arguments,
+    });
+    const ok = !reply.unavailable && reply.status === 200 && reply.json && reply.json.successful === true;
+    if (!ok) {
+      console.error(`defaults for ${app}: lookup answered HTTP ${reply.status || "none"}`);
+      return null;
+    }
+    replies.push(reply.json.data);
+  }
+  console.log(`defaults recorded for ${app}`);
+  return defaultsFromReplies(app, replies);
+}
+
+/**
+ * POST /v1/integrations  →  200 { apps: { gmail, gcal, slack, … } } + otto-integrations
  *
  * Read when the Integrations page opens, and at no other time (decision 7).
  */
@@ -1009,6 +1066,11 @@ async function integrationsStatus(request, env) {
  * managed auth config named in [vars], and records the pending row so the
  * callback can recognise the authorization when the browser comes back. The
  * link expires at Composio's ten minutes; Otto opens it at once.
+ *
+ * Jira's docs say its connection needs `connection_data.subdomain`; A77
+ * (decision 2) tries the link WITHOUT it first, since the hosted flow may
+ * take the site from Atlassian's own picker, and adds a site field only if
+ * the first manual run shows it is required.
  */
 async function integrationsLink(request, env) {
   const auth = await authenticateAccount(request, env);
@@ -1043,10 +1105,16 @@ async function integrationsLink(request, env) {
 /** The managed auth config id for an app, from [vars]. Ids, not secrets. */
 function authConfigFor(env, app) {
   switch (app) {
-    case "gmail": return env.COMPOSIO_AUTH_CONFIG_GMAIL || null;
-    case "gcal":  return env.COMPOSIO_AUTH_CONFIG_GCAL || null;
-    case "slack": return env.COMPOSIO_AUTH_CONFIG_SLACK || null;
-    default:      return null;
+    case "gmail":  return env.COMPOSIO_AUTH_CONFIG_GMAIL || null;
+    case "gcal":   return env.COMPOSIO_AUTH_CONFIG_GCAL || null;
+    case "slack":  return env.COMPOSIO_AUTH_CONFIG_SLACK || null;
+    case "github": return env.COMPOSIO_AUTH_CONFIG_GITHUB || null;
+    case "gitlab": return env.COMPOSIO_AUTH_CONFIG_GITLAB || null;
+    case "jira":   return env.COMPOSIO_AUTH_CONFIG_JIRA || null;
+    case "gdrive": return env.COMPOSIO_AUTH_CONFIG_GDRIVE || null;
+    case "notion": return env.COMPOSIO_AUTH_CONFIG_NOTION || null;
+    case "linear": return env.COMPOSIO_AUTH_CONFIG_LINEAR || null;
+    default:       return null;
   }
 }
 
@@ -1075,7 +1143,13 @@ async function integrationsCallback(request, env) {
       const reply = await composio(env, "GET", `/connected_accounts/${id}`);
       const status = reply.json && typeof reply.json.status === "string" ? reply.json.status : "";
       if (reply.status === 200 && status === "ACTIVE") {
-        await markIntegration(env, row.account_id, row.app, "active");
+        // CONNECT-TIME DEFAULTS (A77): the values a spoken request never
+        // carries, looked up once now and stored on the row. One or two
+        // Composio calls here, never at question time; a failure leaves
+        // the row active with no defaults, and the tool asks for the
+        // detail instead.
+        const defaults = await connectDefaults(env, row.app, row.account_id, id);
+        await activateIntegration(env, row.account_id, row.app, defaults);
         outcome = "connected";
       } else {
         outcome = status === "INITIATED" ? "pending" : "failed";

@@ -152,13 +152,19 @@ mirroring the one hand-set v1 record) for a baked v1 token that signs in, so an
 existing tester keeps their caps (D2). Both rows come from
 `migrations/0002_stage2_plans.sql`.
 
-## Connected apps (A76)
+## Connected apps (A76, widened at A77)
 
 Six routes, none of them the question path. A cloud tool is one Composio
 call; the Worker holds `COMPOSIO_API_KEY` (one reader, `composio()`) and, in
-D1, which apps an account connected and Composio's id for each authorization.
-The authorization itself lives at Composio. Tool arguments and results pass
+D1, which apps an account connected, Composio's id for each authorization,
+when it first connected (`connected_at`, so the header can list apps in
+connect order) and the app's `defaults` — looked up once at the connect
+callback (the GitHub login, the GitLab and Jira projects, the Linear user
+and teams; one or two Composio calls, never at question time). The
+authorization itself lives at Composio. Tool arguments and results pass
 through the isolate for one request and are never logged, counted or stored.
+Nine cloud apps: Gmail, Google Calendar, Slack, GitHub, GitLab, Jira, Google
+Drive, Notion, Linear.
 
     POST /v1/tool                  { tool, input, now, tz } → 200 { ok, result, id } + otto-integrations
     POST /v1/integrations          {}                       → 200 { apps, account } + otto-integrations
@@ -167,28 +173,38 @@ through the isolate for one request and are never logged, counted or stored.
     POST /v1/integrations/unlink   { app }                  → 200 {} + otto-integrations
     POST /v1/integrations/webhook  (signed by Composio)     → 200 {}
 
-`otto-integrations` is `gmail=active;gcal=none;slack=expired` — every cloud
-app's state, on every tool reply, so Otto's snapshot is refreshed by requests
-it already makes. Refusals: `needs_account` for a trial device, `needs_signin`
-with `app` when nothing is connected or the authorization has lapsed,
-`tool_limit` past the plan's `tool_cap` (zero means no gate; `free` is 20 a
-day, `beta` unlimited), `tool_failed` with a one-word `reason`.
+`otto-integrations` is `gmail=active;slack=expired;gcal=none;…` — every cloud
+app's state, on every tool reply, the apps with a row first in the order
+they were connected, so Otto's snapshot is refreshed by requests it already
+makes and a second Mac learns the connect order. Refusals: `needs_account`
+for a trial device, `needs_signin` with `app` when nothing is connected or
+the authorization has lapsed, `tool_limit` past the plan's `tool_cap` (zero
+means no gate; `free` is 20 a day, `beta` unlimited), `needs_detail` with a
+`hint` (`repo`, `project`, `team`) when a default the user never said is not
+on the row, `tool_failed` with a one-word `reason`.
 
 Setup, all out of band:
 
     wrangler secret put COMPOSIO_API_KEY          # the project key, ak_…
     wrangler secret put COMPOSIO_WEBHOOK_SECRET   # from Composio's webhook subscription
-    wrangler d1 migrations apply otto --remote    # 0003_integrations.sql
+    wrangler d1 migrations apply otto --remote    # 0003_integrations.sql, 0004_wave2.sql
 
-The three `COMPOSIO_AUTH_CONFIG_*` entries in `[vars]` are the ids of the
+The nine `COMPOSIO_AUTH_CONFIG_*` entries in `[vars]` are the ids of the
 managed auth configs in Otto's Composio project — identifiers, not secrets.
+The six wave-2 ones (GitHub, GitLab, Jira, Google Drive, Notion, Linear) are
+created in the Composio dashboard, "use Composio managed auth", one per
+toolkit, and pasted in; an app whose id is empty answers `not_provisioned`
+on Connect. Jira's link is requested without `connection_data` first (A77,
+decision 2); if Composio's hosted flow turns out to need the site, the
+callback will say so and a site field is the next change.
 The webhook URL to give Composio is `https://<worker>/v1/integrations/callback`'s
 sibling, `/v1/integrations/webhook`; deliveries are verified as HMAC-SHA256 over
 `webhook-id.webhook-timestamp.body` within five minutes, before the body is
 parsed. `Bench/check-tool-path.sh` asserts the single readers, the verify-before-
 parse order, that no tool route reaches Supabase, that no log line interpolates
-arguments or results, and that `src/tools.js` — the mapping from Otto's ten
-slim tools to Composio's actions — is pure.
+arguments or results, and that `src/tools.js` — the mapping from Otto's
+slim tools to Composio's actions, and the connect-time default lookups — is
+pure.
 
 ## Tests
 
