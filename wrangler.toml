@@ -50,15 +50,15 @@ MAX_IMAGES = "2"
 COMPOSIO_AUTH_CONFIG_GMAIL = "ac_xPpwCkJpxBXc"
 COMPOSIO_AUTH_CONFIG_GCAL = "ac_AJQbYqHNfIx7"
 COMPOSIO_AUTH_CONFIG_SLACK = "ac_vU_uV6PGnq2I"
-# Wave 2 (SPEC.md A77): six more managed auth configs, each created in the
-# Composio dashboard with "use Composio managed auth" for the toolkit named,
-# and pasted here. EMPTY UNTIL CREATED: with no id the app's Connect answers
-# not_provisioned rather than sending the user to a broken link. GitHub's
-# managed app asks for full repository access and Google Drive's for full
-# Drive access; the privacy page says so (A77).
-COMPOSIO_AUTH_CONFIG_GITHUB = ""
-COMPOSIO_AUTH_CONFIG_GITLAB = ""
-COMPOSIO_AUTH_CONFIG_JIRA = ""
-COMPOSIO_AUTH_CONFIG_GDRIVE = ""
-COMPOSIO_AUTH_CONFIG_NOTION = ""
-COMPOSIO_AUTH_CONFIG_LINEAR = ""
+# Wave 2 (SPEC.md A77): six more managed auth configs, created 2026-09-14
+# through POST /api/v3/auth_configs with `use_composio_managed_auth`, named
+# otto-<app>, all OAUTH2 and ENABLED. An app whose id is empty answers
+# not_provisioned on Connect rather than sending the user to a broken link.
+# GitHub's managed app asks for full repository access and Google Drive's
+# for full Drive access; the privacy page says so (A77).
+COMPOSIO_AUTH_CONFIG_GITHUB = "ac_G1Qr1XRo95eC"
+COMPOSIO_AUTH_CONFIG_GITLAB = "ac_dvlrlnG9z8e8"
+COMPOSIO_AUTH_CONFIG_JIRA = "ac_KdF-A2eDbX8N"
+COMPOSIO_AUTH_CONFIG_GDRIVE = "ac_U5sti7s4EAnX"
+COMPOSIO_AUTH_CONFIG_NOTION = "ac_AEAcmoors-ge"
+COMPOSIO_AUTH_CONFIG_LINEAR = "ac_IK7XxJ5S7TV-"
