@@ -111,6 +111,13 @@ for fn in loadAccount checkLimits validate; do
     check "$fn never mentions the integrations table" $?
 done
 
+echo "connected apps — a failure is classified on the number (A58, A77):"
+# FAILING EDIT: derive `reason` from a regex over reply.json.error in runTool.
+body runTool | grep -q 'reply.json.data.status_code'
+check "runTool reads the app's status_code for the reason" $?
+! body runTool | sed 's|//.*||' | grep -E 'reason' | grep -qE 'error\)|message|test\(|match\('
+check "and never the free-text error" $?
+
 echo "connected apps — no words in the log:"
 
 # FAILING EDIT: add `console.log(\`ran ${tool} with ${JSON.stringify(args)}\`)` to runTool.

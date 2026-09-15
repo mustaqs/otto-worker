@@ -846,6 +846,20 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
     composioScript = { "POST /tools/execute/GMAIL_SEND_EMAIL": async () => ({ status: 200, json: { successful: false, error: "Recipient address rejected" } }) };
     const f = await post("/v1/tool", deviceToken, { tool: "gmail_send", input: { to: "bob@example.com", subject: "Hi", body: "Hello" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
     check("an ordinary failure is tool_failed and does not touch the row", f.status === 502 && (await f.json()).error === "tool_failed" && rows.find((r) => r.app === "gmail").state === "active");
+    // A77, from the first run: the app's own 404 is `not_found`, read from
+    // data.status_code — a number — and never from the free-text error.
+    // FAILING EDIT: derive `reason` from /not found/i on reply.json.error.
+    // (The test plan caps tool calls at two a day; the counter is cleared.)
+    for (const k of [...kv.store.keys()]) if (k.startsWith(`u:${accountId}:t:`)) kv.store.delete(k);
+    composioScript = { "POST /tools/execute/GMAIL_SEND_EMAIL": async () => ({ status: 200, json: { successful: false,
+      error: "Repository not found: 'x/y' does not exist", data: { status_code: 404, message: "Not Found" } } }) };
+    const nf = await post("/v1/tool", deviceToken, { tool: "gmail_send", input: { to: "bob@example.com", subject: "Hi", body: "Hello" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    const nfJson = await nf.json();
+    check("an app-side 404 answers tool_failed with reason not_found", nf.status === 502 && nfJson.reason === "not_found");
+    composioScript = { "POST /tools/execute/GMAIL_SEND_EMAIL": async () => ({ status: 200, json: { successful: false,
+      error: "Not Found at all", data: { status_code: 500 } } }) };
+    const txt = await post("/v1/tool", deviceToken, { tool: "gmail_send", input: { to: "bob@example.com", subject: "Hi", body: "Hello" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
+    check("the words 'not found' in the free text do not make it not_found", (await txt.json()).reason === "connector");
   }
 
   // The webhook: verified before parsed, and only the expiry event does anything.

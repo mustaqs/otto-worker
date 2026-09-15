@@ -951,9 +951,16 @@ async function runTool(request, env) {
       return problem(403, "needs_signin", { app: spec.app },
                      integrationsHeader(rows.map((r) => (r.app === spec.app ? { ...r, state: "expired" } : r))));
     }
-    // The status, never the message: the message can quote the arguments.
-    console.error(`tool ${tool}: connector answered HTTP ${reply.status}, successful=${ok}`);
-    return problem(502, "tool_failed", { reason: "connector" }, headers);
+    // CLASSIFIED ON THE NUMBER, NEVER THE TEXT (A58's rule; A77, from the
+    // first run). Composio's `data.status_code` is the app's own HTTP status:
+    // a 404 is the app saying the repository, project or page is not there,
+    // which is a different sentence from "the connector failed". The free
+    // text can quote the arguments and is neither read for this nor logged.
+    const status = reply.json && reply.json.data && Number(reply.json.data.status_code);
+    const reason = status === 404 ? "not_found" : status === 403 ? "forbidden"
+                 : status === 422 ? "rejected" : "connector";
+    console.error(`tool ${tool}: connector answered HTTP ${reply.status}, successful=${ok}, app status ${status || "none"}`);
+    return problem(502, "tool_failed", { reason }, headers);
   }
 
   const { result, id } = compact(tool, reply.json.data);
