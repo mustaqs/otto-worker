@@ -148,6 +148,14 @@ record=$(body "$RUN" recordStep)
 echo "$record" | grep -q "try {" && echo "$record" | grep -q "catch (error)" && ! echo "$record" | sed 's|//.*||' | grep -q "throw"
 check "recordStep is best-effort: it catches, logs and never throws" $?
 
+# FAILING EDIT: move the recordStep out of guardedStep's catch into runTask's
+# catch, keyed on a property set on the error (the shape the live run of
+# 2026-10-11 showed never arrives: the engine rethrows only name and message).
+guarded=$(body "$RUN" guardedStep | sed 's|//.*||')
+echo "$guarded" | grep -A10 "catch (error)" | grep -q 'recordStep(env, task, { name, started, ended: Date.now(), outcome: "failed"' \
+    && [ "$(sed 's|//.*||' "$RUN" | grep -c 'taskStep')" = "0" ]
+check "the failed ledger entry is written inside guardedStep's catch before the rethrow; runTask reads nothing off the engine's error" $?
+
 # FAILING EDIT: import NonRetryableError from "cloudflare:workflows" in run.js.
 elsewhere=$(cat $PURE "$SRC" | sed 's|//.*||' | grep -c '"cloudflare:')
 in_wf=$(sed 's|//.*||' "$WF" | grep -c '"cloudflare:')

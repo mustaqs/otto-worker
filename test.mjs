@@ -1085,7 +1085,11 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
   };
 
   // A step stand-in: runs the callback at once, retries once on an ordinary
-  // throw, never on NonRetryableError; waits resolve from a queue.
+  // throw, never on NonRetryableError; waits resolve from a queue. It rethrows
+  // the way the engine does — a fresh error carrying only the name and the
+  // message — because the live run of 2026-10-11 showed that a property set on
+  // the error inside the callback does not reach the caller of step.do.
+  const engineThrow = (error) => Object.assign(new Error(error && error.message ? error.message : String(error)), { name: error && error.name ? error.name : "Error" });
   const makeStep = (events = []) => {
     const calls = [];
     return {
@@ -1094,9 +1098,9 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
         if (typeof config === "function") { fn = config; config = {}; }
         calls.push({ name, config });
         try { return await fn(); } catch (error) {
-          if (error && error.name === "NonRetryableError") throw error;
+          if (error && error.name === "NonRetryableError") throw engineThrow(error);
           if (config && config.retries && config.retries.limit > 0) { calls.push({ name, config, retry: true }); return await fn(); }
-          throw error;
+          throw engineThrow(error);
         }
       },
       async waitForEvent(name, options) {
@@ -1320,7 +1324,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     const steps = JSON.parse(row.steps);
     check("the ledger marks search-1 failed by class and keeps the plan", steps.some((s) => s.name === "search-1" && s.outcome === "failed" && s.error === "NonRetryableError") && steps.some((s) => s.name === "plan" && s.outcome === "ok"));
     check("the summary carries the fixed ran-out-of-time sentence", JSON.parse(kv.store.get(`tasks:${accountId}`)).unseen.some((u) => u.id === id && u.s === "The research ran out of time."));
-    check("and the log carried the reason word and the step, not the words", logged.some((l) => l === "task research ended failed: max_duration at search-1") && !logged.join("|").includes(SECRET));
+    check("and the log carried the reason word and the step, not the words", logged.some((l) => l === "task research step search-1 failed: NonRetryableError") && logged.some((l) => l === "task research ended failed: max_duration") && !logged.join("|").includes(SECRET));
   }
 
   // --- run: a step fails for good
@@ -1335,8 +1339,13 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     const row = db.tasks.find((t) => t.id === id);
     const steps = JSON.parse(row.steps);
     check("a 400 from the model is not retried and ends the task failed, step_failed",
-          row.state === "failed" && row.reason === "step_failed" && modelCalls.length === 1 && steps.some((s) => s.name === "plan" && s.outcome === "failed" && s.error === "model_http_400"));
-    check("the log named the status and nothing else", logged.includes("task model call: HTTP 400"));
+          row.state === "failed" && row.reason === "step_failed" && modelCalls.length === 1);
+    const failedEntry = steps.find((s) => s.name === "plan");
+    check("a NonRetryableError step leaves a failed ledger entry naming the step, written inside the step and not from the engine's rethrow",
+          failedEntry && failedEntry.outcome === "failed" && failedEntry.error === "model_http_400" && typeof failedEntry.started === "number" && typeof failedEntry.ended === "number"
+          && steps.filter((s) => s.outcome === "failed").length === 1, JSON.stringify(steps));
+    check("the log named the status, the step and the reason, and nothing else",
+          logged.includes("task model call: HTTP 400") && logged.includes("task research step plan failed: model_http_400") && logged.includes("task research ended failed: step_failed"));
   }
 
   // --- approval (correction 1: asked at minute 2, approved at hour 3)

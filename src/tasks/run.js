@@ -74,14 +74,11 @@ export async function runTask({ event, step, env, NonRetryableError }) {
       : error && error.name === "TaskExpired" ? "timeout"
       : "step_failed";
     const state = reason === "declined" ? "cancelled" : reason === "timeout" ? "expired" : "failed";
-    // The reason word and the step's name, never the words.
-    console.error(`task ${task.type} ended ${state}: ${reason}${error && error.taskStep ? ` at ${error.taskStep}` : ""}`);
-    if (error && error.taskStep) {
-      await recordStep(env, task, {
-        name: error.taskStep, started: error.taskStarted || null, ended: Date.now(),
-        outcome: "failed", error: errorWord(error),
-      });
-    }
+    // The reason word, never the words. The failed step named itself in the
+    // ledger and the log before it threw (guardedStep, askUser): a property
+    // set on the error inside step.do does not survive the engine's rethrow,
+    // only the name and the message do — seen live on 2026-10-11.
+    console.error(`task ${task.type} ended ${state}: ${reason}`);
     await finalStep(step, "finish-failed", () => finishTask(env, task, state, { reason }));
   }
 }
@@ -98,18 +95,19 @@ function guardedStep({ step, env, task, NonRetryableError }, name, fn, config = 
   }, async () => {
     const row = await readRow(env, task);
     const elapsed = Date.now() - task.createdAt - (Number(row && row.waited_ms) || 0);
-    if (elapsed > task.maxDurationMs) {
-      // Named like a failed step, so the ledger and the log say where the clock ran out.
-      const error = new NonRetryableError(`max_duration before ${name} at ${elapsed}ms`);
-      error.taskStep = name; error.taskStarted = Date.now();
-      throw error;
-    }
     const started = Date.now();
     let out;
     try {
+      if (elapsed > task.maxDurationMs) throw new NonRetryableError(`max_duration before ${name} at ${elapsed}ms`);
       out = await fn();
     } catch (error) {
-      if (error && typeof error === "object") { error.taskStep = name; error.taskStarted = started; }
+      // THE FAILED ENTRY IS WRITTEN HERE, inside the step, best-effort, before
+      // the rethrow: the engine hands the caller a fresh error with only the
+      // name and the message, so nothing attached here would reach runTask.
+      // A retry that then succeeds replaces this entry under the same name.
+      const word = errorWord(error);
+      console.error(`task ${task.type} step ${name} failed: ${word}`);
+      await recordStep(env, task, { name, started, ended: Date.now(), outcome: "failed", error: word });
       throw error;
     }
     // BEST-EFFORT. The work is done; the ledger must not undo it.
@@ -140,7 +138,11 @@ async function askUser({ step, env, task, entry }, spoken) {
   try {
     event = await step.waitForEvent("ask-wait", { type: "approval", timeout: `${until - askedAt} ms` });
   } catch (error) {
-    if (isTimeout(error)) throw Object.assign(new Error("timeout"), { name: "TaskExpired", taskStep: "ask-wait", taskStarted: askedAt });
+    const expired = isTimeout(error);
+    const word = expired ? "TaskExpired" : errorWord(error);
+    console.error(`task ${task.type} step ask-wait failed: ${word}`);
+    await recordStep(env, task, { name: "ask-wait", started: askedAt, ended: Date.now(), outcome: "failed", error: word });
+    if (expired) throw Object.assign(new Error("timeout"), { name: "TaskExpired" });
     throw error;
   }
   const decision = event && event.payload && event.payload.decision === "approve" ? "approve" : "decline";
@@ -153,7 +155,7 @@ async function askUser({ step, env, task, entry }, spoken) {
 /**
  * The platform does not name its timeout error in the docs read on
  * 2026-10-10. The name is checked first and the message second; the first
- * live timeout pins which one fires (its class is logged in run's catch).
+ * live timeout pins which one fires (its class is logged beside the ask-wait step).
  */
 export function isTimeout(error) {
   if (!error) return false;
