@@ -1,5 +1,7 @@
 name = "otto-worker"
-main = "src/index.js"
+# src/main.js re-exports the fetch handler from src/index.js — still the entry
+# for test.mjs and the benches — beside the one Workflow class (SPEC.md A82).
+main = "src/main.js"
 compatibility_date = "2026-08-01"
 
 # Off deliberately: with preview URLs on, every deployed version gets its own
@@ -20,6 +22,18 @@ id = "a8141d2bc3cf455fa4a25d20014e2832"
 binding = "DB"
 database_name = "otto"
 database_id = "0206e486-ed56-472d-ac58-d24c998f9cf2"
+
+# Long-running tasks (SPEC.md A82). One Workflow for every task type; the
+# type is a param. The instance keeps completed and errored state for the
+# same seven days the D1 row does, and /v1/tasks/take deletes it once the
+# result has been collected, so there is one retention and not two.
+[[workflows]]
+name = "otto-tasks"
+binding = "TASKS"
+class_name = "OttoTask"
+  [workflows.default_retention]
+  success_retention = "7 days"
+  error_retention = "7 days"
 
 [observability]
 enabled = false
