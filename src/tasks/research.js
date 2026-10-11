@@ -15,10 +15,10 @@ const FINDINGS_MAX_CHARS = 65536;
 
 /**
  * Direct web search on the task's model. `allowed_callers: ["direct"]` keeps
- * dynamic filtering's hidden code execution out of the step; if the API
- * rejects the field on this model, the fallback is the basic
- * `web_search_20250305`, which is direct by definition. Untested until the
- * first live step.
+ * dynamic filtering's hidden code execution out of the step. Accepted by
+ * claude-sonnet-5 on the first live run (2026-10-11: ten search steps, two
+ * searches each, about 20,000 input tokens and 8 cents a step), so there is
+ * no fallback to the basic `web_search_20250305` and none is coded.
  */
 export const WEB_SEARCH = {
   type: "web_search_20260209",
