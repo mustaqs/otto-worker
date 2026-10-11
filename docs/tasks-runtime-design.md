@@ -281,7 +281,7 @@ Ids travel in the body, like `{ app }` does, because the router is exact-match.
 
 | route | body | 200 | errors |
 | --- | --- | --- | --- |
-| `/v1/tasks/create` | `{ type, request, context?, document?, now, tz }` | `{ id, state: "running" }` | `400 unknown_type`; `400 bad_request` (request empty or > 4,000 chars; `now` not ISO); `400 document_not_allowed` (type lacks `needsDocument`, or document > 32 KB); `400 bad_request` on any key outside `type request context document now tz` — an image key never gets a name of its own; `429 task_limit` (no `retryAfter`: the day resets, the row says when via `otto-usage`'s `day-resets`); `503 not_provisioned` (no `TASKS` binding or plan row) |
+| `/v1/tasks/create` | `{ type, request, context?, document?, now, tz }` | `{ id, state: "created" }` (the Workflow's first step makes it `running`) | `400 unknown_type`; `400 bad_request` (request empty or > 4,000 chars; `now` not ISO); `400 document_not_allowed` (type lacks `needsDocument`, or document > 32 KB); `400 bad_request` on any key outside `type request context document now tz` — an image key never gets a name of its own; `429 task_limit` (no `retryAfter`: the day resets, the row says when via `otto-usage`'s `day-resets`); `503 not_provisioned` (no `TASKS` binding or plan row) |
 | `/v1/tasks/approve` | `{ id, decision: "approve" \| "decline" }` | `{ id, state }` (`approved` / `declined`) | `404 not_found`; `409 not_awaiting` (any other state, including `expired`); `400 bad_request` |
 | `/v1/tasks/cancel` | `{ id }` | `{ id, state: "cancelled" }` | `404 not_found`; `409 already_finished` |
 | `/v1/tasks/take` | `{ id }` | `{ id, type, state, reason?, result: { spoken, detail, deliver }?, steps: [{ name, outcome, cents }] }` — marks `seen_at`, deletes the instance | `404 not_found`; `409 not_finished` (non-terminal) |
@@ -456,7 +456,7 @@ function guardedStep({ step, env, task, NonRetryableError }, name, fn, config = 
   });
 }
 
-/** THE OTHER CALLER OF step.do, for the two finishing steps only: no clock check, no retries beyond one, so a task that ran out of time can still write that it did. */
+/** THE OTHER CALLER OF step.do, for the finishing steps only (finish, finish-failed, and the unknown-type refusal): no clock check, so a task that ran out of time can still write that it did. */
 function finalStep(step, name, fn) {
   return step.do(name, { timeout: "1 minute", retries: { limit: 1, delay: "5 seconds", backoff: "constant" } }, fn);
 }
@@ -559,9 +559,9 @@ verified red by the edit named beside it. Files: `SRC=src/index.js`,
 | 1 | `env.ANTHROPIC_API_KEY` is read exactly once in `src/index.js` (inside `fetch`) and exactly once under `src/tasks/`, inside `anthropic()` | read it in `runResearch` |
 | 2 | `loadAccount`, `checkLimits`, `validate` never mention `TASKS` or `prepare(` (comments stripped) | add `env.TASKS` to `checkLimits` |
 | 3 | `checkLimits` contains no `put(` of `tasksKey`; the only `tasks:` literal in `src/index.js` is in `counterKeys` | add `env.OTTO.put(tasksKey, …)` to the commit |
-| 4 | `step.do(` appears in `run.js` only inside `guardedStep` and `finalStep`, and nowhere else under `src/tasks/` | call `step.do` in `research.js` |
+| 4 | `step.do(` appears in `run.js` only inside `guardedStep`, `finalStep` and `askUser` (its two bookkeeping steps), and nowhere else under `src/tasks/` | call `step.do` in `research.js` |
 | 5 | `guardedStep` contains `maxDurationMs` and `NonRetryableError(` | delete the comparison |
-| 6 | `finalStep` is called exactly twice, both inside `runTask` | add a third call |
+| 6 | `finalStep` is called exactly three times, all inside `runTask` (unknown type, finish, finish-failed) | add a fourth call |
 | 7 | `waitForEvent(` appears only inside `askUser`, with `timeout:` on the same call | remove the timeout |
 | 8 | `cloudflare:` imports appear only in `src/tasks/workflow.js`; `run.js`, `research.js`, `registry.js`, `summary.js`, `model.js` import no platform module | import `NonRetryableError` in `run.js` |
 | 9 | `src/main.js` exports `default` from `./index.js` and `OttoTask`; `wrangler.toml` `main` is `src/main.js`; `class_name = "OttoTask"` | point `main` back at `src/index.js` |

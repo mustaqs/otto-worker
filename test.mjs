@@ -982,5 +982,567 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
   globalThis.fetch = async () => anthropicEmpty();
 }
 
+
+// -------------------------------------------------------------------- tasks
+
+console.log("tasks (A82): a row, a Workflow, a header — never the question path:");
+{
+  const { runTask, RETENTION_MS, durationMs, isTimeout } = await import("./src/tasks/run.js");
+  const { TYPES, centsOf, TASK_VERSION } = await import("./src/tasks/registry.js");
+  const { summaryFromRows, tasksHeader } = await import("./src/tasks/summary.js");
+
+  class NonRetryableError extends Error { constructor(m) { super(m); this.name = "NonRetryableError"; } }
+
+  // THE CLOCK. run.js reads Date.now() and nothing else; the test owns it.
+  const realNow = Date.now;
+  let clock = realNow();
+  Date.now = () => clock;
+  const advance = (ms) => { clock += ms; };
+  const MIN = 60 * 1000, HOUR = 60 * MIN;
+
+  const accountId = "acct-tasks-1111";
+  const deviceToken = "device-for-tasks";
+  const otherToken = "device-other-acct";
+  const trialToken = "trial-for-tasks";
+  const kv = makeKV({
+    [`token:${deviceToken}`]: JSON.stringify({ v: 2, subject: accountId, kind: "device", plan: "free", active: true, dailyCap: 50, hourlyCap: 20, trialCap: 0 }),
+    [`token:${otherToken}`]: JSON.stringify({ v: 2, subject: "acct-other", kind: "device", plan: "free", active: true, dailyCap: 50, hourlyCap: 20, trialCap: 0 }),
+    [`token:${trialToken}`]: JSON.stringify({ v: 2, subject: trialToken, kind: "trial", plan: "trial", active: true, dailyCap: 10, hourlyCap: 10, trialCap: 10 }),
+  });
+  const plans = { free: { name: "free", daily_cap: 50, hourly_cap: 20, trial_cap: 0, tool_cap: 0, task_cap: 2 } };
+
+  // A D1 stand-in with a tasks table. One UPDATE shape to parse:
+  // `UPDATE tasks SET a = ?, b = ? WHERE id = ? AND account_id = ?`.
+  const makeTaskDB = () => {
+    const tasks = [];
+    const calls = [];
+    const failures = { stepsWrites: 0, skip: 0 };   // throw on the next `stepsWrites` steps writes, after skipping `skip`
+    return {
+      tasks, calls, failures,
+      prepare: (sql) => ({ bind: (...args) => {
+        const q = sql.replace(/\s+/g, " ").trim();
+        calls.push(q.slice(0, 40));
+        return {
+          first: async () => {
+            if (q.includes("FROM plans")) return plans[args[0]] || null;
+            if (q.startsWith("SELECT * FROM tasks WHERE id = ? AND account_id = ?")) {
+              const row = tasks.find((t) => t.id === args[0] && t.account_id === args[1]);
+              return row ? { ...row } : null;
+            }
+            return null;
+          },
+          all: async () => {
+            if (q.startsWith("SELECT * FROM tasks WHERE account_id = ?")) {
+              return { results: tasks.filter((t) => t.account_id === args[0]).sort((a, b) => b.updated_at - a.updated_at).map((t) => ({ ...t })) };
+            }
+            return { results: [] };
+          },
+          run: async () => {
+            if (q.startsWith("INSERT INTO tasks")) {
+              const [id, account_id, type, input, created_at, updated_at] = args;
+              tasks.push({ id, account_id, type, state: "created", input, steps: "[]", question: null, answer: null, result: null,
+                           reason: null, waited_ms: 0, seen_at: null, created_at, updated_at, finished_at: null, expires_at: null });
+              return;
+            }
+            if (q.startsWith("UPDATE tasks SET")) {
+              const set = q.slice("UPDATE tasks SET ".length, q.indexOf(" WHERE"));
+              const cols = set.split(",").map((s) => s.trim().split(" = ")[0]);
+              if (cols.includes("steps") && failures.stepsWrites > 0) {
+                if (failures.skip > 0) failures.skip--;
+                else { failures.stepsWrites--; throw Object.assign(new Error("d1 unavailable"), { name: "D1Error" }); }
+              }
+              const row = tasks.find((t) => t.id === args[cols.length] && t.account_id === args[cols.length + 1]);
+              if (row) cols.forEach((c, i) => { row[c] = args[i]; });
+              return;
+            }
+            if (q.startsWith("DELETE FROM tasks")) {
+              const i = tasks.findIndex((t) => t.id === args[0] && t.account_id === args[1]);
+              if (i >= 0) tasks.splice(i, 1);
+            }
+          },
+        };
+      } }),
+    };
+  };
+
+  // A Workflow binding stand-in: records creates and instance calls.
+  const makeTasksBinding = () => {
+    const created = [], log = [], instances = new Map();
+    const binding = { created, log, instances, failCreate: false };
+    const instance = (id) => ({
+      id,
+      sendEvent: async (event) => { log.push({ id, call: "sendEvent", event }); if (instances.get(id).throwOnEvent) throw Object.assign(new Error("not running"), { name: "WorkflowError" }); },
+      terminate: async () => { log.push({ id, call: "terminate" }); },
+      delete: async () => { log.push({ id, call: "delete" }); if (instances.get(id).gone) throw Object.assign(new Error("gone"), { name: "WorkflowNotFound" }); instances.get(id).gone = true; },
+      status: async () => ({ status: "running" }),
+    });
+    binding.create = async (options) => {
+      if (binding.failCreate) throw Object.assign(new Error("refused"), { name: "WorkflowError" });
+      created.push(options); instances.set(options.id, {}); return instance(options.id);
+    };
+    binding.get = async (id) => { if (!instances.has(id)) throw Object.assign(new Error("not found"), { name: "WorkflowNotFound" }); return instance(id); };
+    return binding;
+  };
+
+  // A step stand-in: runs the callback at once, retries once on an ordinary
+  // throw, never on NonRetryableError; waits resolve from a queue.
+  const makeStep = (events = []) => {
+    const calls = [];
+    return {
+      calls, events,
+      async do(name, config, fn) {
+        if (typeof config === "function") { fn = config; config = {}; }
+        calls.push({ name, config });
+        try { return await fn(); } catch (error) {
+          if (error && error.name === "NonRetryableError") throw error;
+          if (config && config.retries && config.retries.limit > 0) { calls.push({ name, config, retry: true }); return await fn(); }
+          throw error;
+        }
+      },
+      async waitForEvent(name, options) {
+        calls.push({ name, config: options, wait: true });
+        const next = events.shift();
+        if (!next) throw Object.assign(new Error("Timeout: event not received"), { name: "WorkflowTimeoutError" });
+        if (next.throw) throw next.throw;
+        if (next.before) await next.before();
+        return { type: options.type, payload: next.payload, timestamp: new Date(clock) };
+      },
+    };
+  };
+
+  // The model, scripted. Each entry: { content, usage } or { status } with an optional `before`.
+  let script = [];
+  const modelCalls = [];
+  const anthropicDone = () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url) === "https://api.anthropic.com/v1/messages" && init.body && !JSON.parse(init.body).stream) {
+      const body = JSON.parse(init.body);
+      modelCalls.push({ body, headers: init.headers });
+      const next = script.shift();
+      if (!next) return new Response(JSON.stringify({ content: [{ type: "text", text: "{}" }], usage: {} }), { status: 200 });
+      if (next.before) await next.before();
+      if (next.status) return new Response("error", { status: next.status });
+      return new Response(JSON.stringify({ content: next.content, usage: next.usage || {} }), { status: 200 });
+    }
+    return anthropicDone();
+  };
+  const text = (t, usage) => ({ content: [{ type: "text", text: t }], usage });
+  const searchReply = (findings, searches, urls = []) => ({
+    content: [
+      { type: "server_tool_use", id: "s1", name: "web_search", input: { query: "q" } },
+      { type: "web_search_tool_result", tool_use_id: "s1", content: urls.map((u) => ({ type: "web_search_result", url: u, title: "t", encrypted_content: "x" })) },
+      { type: "text", text: findings },
+    ],
+    usage: { input_tokens: 3000, output_tokens: 600, server_tool_use: { web_search_requests: searches } },
+  });
+
+  const logged = [];
+  const capture = async (work) => {
+    const realLog = console.log, realError = console.error;
+    console.log = (...a) => logged.push(a.map(String).join(" "));
+    console.error = (...a) => logged.push(a.map(String).join(" "));
+    try { return await work(); } finally { console.log = realLog; console.error = realError; }
+  };
+
+  const db = makeTaskDB();
+  const tasks = makeTasksBinding();
+  // The model key is assembled at runtime: Bench/check-no-secrets.sh scans this file.
+  const envTasks = { ...env(kv), DB: db, TASKS: tasks, ANTHROPIC_API_KEY: ["sk", "ant", "TESTKEY-not-real-0000000000"].join("-") };
+  const post = (path, token, body) => worker.fetch(new Request(`https://w${path}`, {
+    method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify(body) }), envTasks, makeCtx());
+  const header = (response) => response.headers.get("otto-tasks") || "";
+  const clearCounter = () => { for (const k of [...kv.store.keys()]) if (k.startsWith(`u:${accountId}:k:`)) kv.store.delete(k); };
+  const SECRET = "SECRETWORD";
+  const goodBody = { type: "research", request: `How do Swift actors handle reentrancy ${SECRET}`, context: "Xcode · Brain.swift", now: "2026-10-11T09:00:00Z", tz: "Asia/Kolkata" };
+  const runWorkflow = async (id, step) => {
+    const created = tasks.created.find((c) => c.id === id);
+    const row = db.tasks.find((t) => t.id === id);
+    const event = { payload: created.params, timestamp: new Date(row.created_at), instanceId: id };
+    return capture(() => runTask({ event, step, env: envTasks, NonRetryableError }));
+  };
+
+  // --- create
+  {
+    const before = db.calls.length;
+    const r = await post("/v1/tasks/create", trialToken, goodBody);
+    check("a trial device is refused a task with needs_account before D1 is read", r.status === 403 && (await r.json()).error === "needs_account" && db.calls.length === before);
+    check("an unknown type is refused", (await post("/v1/tasks/create", deviceToken, { ...goodBody, type: "dinner" })).status === 400
+          && (await (await post("/v1/tasks/create", deviceToken, { ...goodBody, type: "dinner" })).json()).error === "unknown_type");
+    check("an empty request, a 4,001-char request and a bad `now` are bad_request",
+          (await post("/v1/tasks/create", deviceToken, { ...goodBody, request: " " })).status === 400
+          && (await post("/v1/tasks/create", deviceToken, { ...goodBody, request: "x".repeat(4001) })).status === 400
+          && (await post("/v1/tasks/create", deviceToken, { ...goodBody, now: "yesterday" })).status === 400);
+    const doc = await post("/v1/tasks/create", deviceToken, { ...goodBody, document: "text" });
+    check("a document on research is document_not_allowed", doc.status === 400 && (await doc.json()).error === "document_not_allowed");
+    const img = await post("/v1/tasks/create", deviceToken, { ...goodBody, image: "data:image/jpeg;base64,AAAA" });
+    check("an image key is refused before anything is written", img.status === 400 && (await img.json()).key === "image" && db.tasks.length === 0 && tasks.created.length === 0);
+
+    const r1 = await post("/v1/tasks/create", deviceToken, goodBody);
+    const j1 = await r1.json();
+    const row = db.tasks.find((t) => t.id === j1.id);
+    check("a good create answers the id and `created`", r1.status === 200 && typeof j1.id === "string" && j1.state === "created", JSON.stringify(j1));
+    check("the row holds exactly the six input fields and the task version",
+          row && row.state === "created" && JSON.stringify(Object.keys(JSON.parse(row.input)).sort())
+            === JSON.stringify(["context", "now", "request", "taskVersion", "tz"]) && JSON.parse(row.input).taskVersion === TASK_VERSION);
+    const created = tasks.created[0];
+    check("the instance was created with the row's id, the params and the row's retention",
+          created && created.id === j1.id && created.params.type === "research" && created.params.accountId === accountId
+          && created.params.input.request === goodBody.request && created.params.taskVersion === TASK_VERSION
+          && created.retention.successRetention === "7 days" && created.retention.errorRetention === "7 days");
+    check("the day counter was written before the create", [...kv.store.keys()].some((k) => k.startsWith(`u:${accountId}:k:`)) && kv.store.get([...kv.store.keys()].find((k) => k.startsWith(`u:${accountId}:k:`))) === "1");
+    check("the reply's header lists the new task as created", header(r1) === `v=1;running=1;awaiting=0;unseen=0;t=${j1.id}:created:research`, header(r1));
+
+    await post("/v1/tasks/create", deviceToken, goodBody);
+    const third = await post("/v1/tasks/create", deviceToken, goodBody);
+    check("the plan's task cap refuses the third create and creates no instance", third.status === 429 && (await third.json()).error === "task_limit" && tasks.created.length === 2);
+    check("the refusal still carries the header", header(third).startsWith("v=1;running=2;"));
+    clearCounter();
+    // The second task is not run; it is deleted so the rest of the block sees one.
+    await post("/v1/tasks/delete", deviceToken, { id: tasks.created[1].id });
+
+    tasks.failCreate = true;
+    const refused = await capture(() => post("/v1/tasks/create", deviceToken, goodBody));
+    tasks.failCreate = false;
+    check("a platform refusal on create removes the row and answers task_not_started", refused.status === 502 && (await refused.json()).error === "task_not_started" && db.tasks.length === 1);
+    clearCounter();
+  }
+
+  // --- run: the happy path
+  const taskId = tasks.created[0].id;
+  let happyCents = 0;
+  {
+    const usages = [
+      { input_tokens: 500, output_tokens: 80 },
+      { input_tokens: 3000, output_tokens: 600, server_tool_use: { web_search_requests: 3 } },
+      { input_tokens: 3000, output_tokens: 600, server_tool_use: { web_search_requests: 2 } },
+      { input_tokens: 3000, output_tokens: 600, server_tool_use: { web_search_requests: 1 } },
+      { input_tokens: 9000, output_tokens: 1500 },
+    ];
+    happyCents = usages.reduce((sum, u) => sum + centsOf("claude-sonnet-5", {
+      in: u.input_tokens, out: u.output_tokens, searches: u.server_tool_use ? u.server_tool_use.web_search_requests : 0 }), 0);
+    script = [
+      text(JSON.stringify({ queries: ["swift actor reentrancy", "actor hop suspension", "reentrancy pitfalls"], outline: "the rule, then the pitfall" }), usages[0]),
+      { ...searchReply(`Actors are reentrant at every await ${SECRET}`, 3, ["https://swift.org/a"]), usage: usages[1] },
+      { ...searchReply("A hop is a suspension point", 2, ["https://swift.org/b"]), usage: usages[2] },
+      { ...searchReply("Pitfalls: stale state after await", 1), usage: usages[3] },
+      text("```json\n" + JSON.stringify({ title: "Swift actor reentrancy", spoken: "Actors are reentrant at every await, so state read before an await can be stale after it.", body: `# Answer\nReentrant. ${SECRET}\n\n## Sources\n- https://swift.org/a` }) + "\n```", usages[4]),
+    ];
+    modelCalls.length = 0; logged.length = 0;
+    const step = makeStep();
+    await runWorkflow(taskId, step);
+    const row = db.tasks.find((t) => t.id === taskId);
+    const names = step.calls.map((c) => c.name);
+    check("the steps ran in order: start, plan, search-1..3, draft, finish",
+          JSON.stringify(names) === JSON.stringify(["start", "plan", "search-1", "search-2", "search-3", "draft", "finish"]), JSON.stringify(names));
+    check("every step carried a timeout and retries", step.calls.every((c) => c.config && c.config.timeout && c.config.retries));
+    const result = JSON.parse(row.result);
+    check("the row ended succeeded with a spoken sentence, a note to deliver, finished_at and a seven-day expires_at",
+          row.state === "succeeded" && result.spoken.length > 0 && result.spoken.length <= 240 && result.deliver.notes.title === "Swift actor reentrancy"
+          && result.detail.startsWith("# Answer") && row.finished_at === clock && row.expires_at === row.finished_at + RETENTION_MS);
+    const steps = JSON.parse(row.steps);
+    const ledgerCents = steps.reduce((s, e) => s + (e.cents || 0), 0);
+    check("the ledger has one entry per step and its cents sum to the scripted usage at the price table",
+          steps.length === 6 && steps.map((s) => s.name).join(",") === "start,plan,search-1,search-2,search-3,draft"
+          && Math.abs(ledgerCents - happyCents) < 0.001 && steps[2].searches === 3 && steps[2].model === "claude-sonnet-5", `${ledgerCents} vs ${happyCents}`);
+    check("the search steps carried exactly the direct, bounded web search tool and the plan and draft carried none",
+          modelCalls.length === 5
+          && [1, 2, 3].every((i) => JSON.stringify(modelCalls[i].body.tools) === JSON.stringify([{ type: "web_search_20260209", name: "web_search", allowed_callers: ["direct"], max_uses: 3 }]))
+          && modelCalls[0].body.tools === undefined && modelCalls[4].body.tools === undefined);
+    check("every call was on claude-sonnet-5 with the key as x-api-key", modelCalls.every((c) => c.body.model === "claude-sonnet-5" && c.headers["x-api-key"] === envTasks.ANTHROPIC_API_KEY));
+    const summary = JSON.parse(kv.store.get(`tasks:${accountId}`));
+    check("the KV summary now has one unseen result with its sentence", summary.unseen.length === 1 && summary.unseen[0].id === taskId && summary.unseen[0].s === result.spoken && summary.running.length === 0);
+    check("the console carried no word of the request, the findings or the draft", !logged.join("|").includes(SECRET), logged.join("|").slice(0, 200));
+    check("and neither did KV beyond the one spoken sentence", ![...kv.store.values()].join("|").includes(SECRET));
+    check("the result's detail is in the row, not in the summary", !JSON.stringify(summary).includes("# Answer"));
+  }
+
+  // --- run: a retry replaces its own ledger entry
+  {
+    clearCounter();
+    const r = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id = (await r.json()).id;
+    let first = true;
+    script = [
+      text(JSON.stringify({ queries: ["one"] }), { input_tokens: 10, output_tokens: 10 }),
+      { ...searchReply("findings", 1), before: () => { if (first) { first = false; throw Object.assign(new Error("flaky"), { name: "TypeError" }); } } },
+      text(JSON.stringify({ title: "T", spoken: "S", body: "B" }), { input_tokens: 10, output_tokens: 10 }),
+    ];
+    const step = makeStep();
+    await runWorkflow(id, step);
+    const row = db.tasks.find((t) => t.id === id);
+    const steps = JSON.parse(row.steps);
+    check("a step's first attempt failing and its retry succeeding leaves one ledger entry for it",
+          row.state === "succeeded" && step.calls.some((c) => c.retry && c.name === "search-1") && steps.filter((s) => s.name === "search-1").length === 1);
+  }
+
+  // --- run: the ledger is best-effort (correction 2)
+  {
+    clearCounter();
+    const r = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id = (await r.json()).id;
+    script = [
+      text(JSON.stringify({ queries: ["one"] }), { input_tokens: 10, output_tokens: 10 }),
+      searchReply("findings", 1),
+      text(JSON.stringify({ title: "T", spoken: "S", body: "B" }), { input_tokens: 10, output_tokens: 10 }),
+    ];
+    modelCalls.length = 0; logged.length = 0;
+    db.failures.stepsWrites = 1; db.failures.skip = 1;   // the start step's write passes; the plan's throws once
+    const step = makeStep();
+    await runWorkflow(id, step);
+    const row = db.tasks.find((t) => t.id === id);
+    const planCalls = step.calls.filter((c) => c.name === "plan");
+    check("a ledger write failing after the plan's model call leaves exactly one model call for the plan and no retry",
+          modelCalls.filter((c) => c.body.system.startsWith("You plan")).length === 1 && planCalls.length === 1 && !planCalls[0].retry);
+    check("the run continued to succeeded", row.state === "succeeded");
+    check("and the failure was logged by class, without words",
+          logged.some((l) => l.includes("task ledger not written for plan (D1Error)")) && !logged.join("|").includes(SECRET));
+    check("the later steps' entries were still written", JSON.parse(row.steps).some((s) => s.name === "draft"));
+  }
+
+  // --- run: past the maximum duration (the fake clock)
+  {
+    clearCounter();
+    const r = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id = (await r.json()).id;
+    script = [
+      text(JSON.stringify({ queries: ["one", "two"] }), { input_tokens: 10, output_tokens: 10 }).valueOf(),
+    ];
+    script[0].before = () => advance(31 * MIN);   // the plan takes 31 minutes
+    script.push(searchReply("never", 1));
+    modelCalls.length = 0; logged.length = 0;
+    const step = makeStep();
+    await runWorkflow(id, step);
+    const row = db.tasks.find((t) => t.id === id);
+    check("a task past maxDurationMs ends failed with reason max_duration", row.state === "failed" && row.reason === "max_duration", `${row.state}/${row.reason}`);
+    check("the guard threw before search-1's work: one model call, no retry, then finish-failed",
+          modelCalls.length === 1 && step.calls.map((c) => c.name).join(",") === "start,plan,search-1,finish-failed" && !step.calls.some((c) => c.retry));
+    const steps = JSON.parse(row.steps);
+    check("the ledger marks search-1 failed by class and keeps the plan", steps.some((s) => s.name === "search-1" && s.outcome === "failed" && s.error === "NonRetryableError") && steps.some((s) => s.name === "plan" && s.outcome === "ok"));
+    check("the summary carries the fixed ran-out-of-time sentence", JSON.parse(kv.store.get(`tasks:${accountId}`)).unseen.some((u) => u.id === id && u.s === "The research ran out of time."));
+    check("and the log carried the reason word and the step, not the words", logged.some((l) => l === "task research ended failed: max_duration at search-1") && !logged.join("|").includes(SECRET));
+  }
+
+  // --- run: a step fails for good
+  {
+    clearCounter();
+    const r = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id = (await r.json()).id;
+    script = [{ status: 400 }, { status: 400 }, { status: 400 }];
+    modelCalls.length = 0; logged.length = 0;
+    const step = makeStep();
+    await runWorkflow(id, step);
+    const row = db.tasks.find((t) => t.id === id);
+    const steps = JSON.parse(row.steps);
+    check("a 400 from the model is not retried and ends the task failed, step_failed",
+          row.state === "failed" && row.reason === "step_failed" && modelCalls.length === 1 && steps.some((s) => s.name === "plan" && s.outcome === "failed" && s.error === "model_http_400"));
+    check("the log named the status and nothing else", logged.includes("task model call: HTTP 400"));
+  }
+
+  // --- approval (correction 1: asked at minute 2, approved at hour 3)
+  let approvedId;
+  {
+    clearCounter();
+    const r = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id = (await r.json()).id; approvedId = id;
+    const eight = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    script = [text(JSON.stringify({ queries: eight }), { input_tokens: 10, output_tokens: 10 })];
+    script[0].before = () => advance(2 * MIN);
+    for (const q of eight) script.push(searchReply(`found ${q}`, 1));
+    script.push(text(JSON.stringify({ title: "T", spoken: "S", body: "B" }), { input_tokens: 10, output_tokens: 10 }));
+    let approveReply, rowWhileWaiting, summaryWhileWaiting;
+    const step = makeStep([{
+      payload: { decision: "approve" },
+      before: async () => {
+        rowWhileWaiting = { ...db.tasks.find((t) => t.id === id) };
+        summaryWhileWaiting = JSON.parse(kv.store.get(`tasks:${accountId}`));
+        advance(2 * HOUR + 58 * MIN);
+        approveReply = await post("/v1/tasks/approve", deviceToken, { id, decision: "approve" });
+      },
+    }]);
+    await runWorkflow(id, step);
+    const row = db.tasks.find((t) => t.id === id);
+    const question = JSON.parse(rowWhileWaiting.question);
+    check("more searches than askAboveSearches put the row in awaiting_approval with a question and the full 24-hour window",
+          rowWhileWaiting.state === "awaiting_approval" && question.spoken.includes("8 searches") && question.until - question.askedAt === 24 * HOUR);
+    check("the summary carried the question while waiting", summaryWhileWaiting.awaiting.length === 1 && summaryWhileWaiting.awaiting[0].q === question.spoken);
+    const wait = step.calls.find((c) => c.wait);
+    check("the wait was for the approval type with the full 24-hour timeout", wait.config.type === "approval" && wait.config.timeout === `${24 * HOUR} ms`);
+    check("approve answered 200 approved and sent the event to the instance",
+          approveReply.status === 200 && (await approveReply.json()).state === "approved"
+          && tasks.log.some((l) => l.id === id && l.call === "sendEvent" && l.event.type === "approval" && l.event.payload.decision === "approve"));
+    check("asked at minute 2 and approved at hour 3, the run continued and succeeded", row.state === "succeeded", `${row.state}/${row.reason}`);
+    check("the row records the wait, so the clock forgave it", row.waited_ms >= 2 * HOUR + 58 * MIN && row.waited_ms < 3 * HOUR);
+    check("the answer is on the row", JSON.parse(row.answer).decision === "approve");
+    check("approving a row that is no longer awaiting is not_awaiting", (await post("/v1/tasks/approve", deviceToken, { id, decision: "approve" })).status === 409);
+    check("another account's id is not found", (await post("/v1/tasks/approve", otherToken, { id, decision: "approve" })).status === 404);
+    check("a bad decision is bad_request", (await post("/v1/tasks/approve", deviceToken, { id, decision: "maybe" })).status === 400);
+  }
+
+  // --- approval: declined
+  {
+    clearCounter();
+    const r = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id = (await r.json()).id;
+    const eight = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    script = [text(JSON.stringify({ queries: eight }), { input_tokens: 10, output_tokens: 10 }), searchReply("never", 1)];
+    modelCalls.length = 0;
+    const step = makeStep([{ payload: { decision: "decline" }, before: async () => { await post("/v1/tasks/approve", deviceToken, { id, decision: "decline" }); } }]);
+    await runWorkflow(id, step);
+    const row = db.tasks.find((t) => t.id === id);
+    check("declined ends cancelled with reason declined and no search was made", row.state === "cancelled" && row.reason === "declined" && modelCalls.length === 1);
+    check("the summary says why", JSON.parse(kv.store.get(`tasks:${accountId}`)).unseen.some((u) => u.id === id && u.s === "The research stopped because you said no."));
+  }
+
+  // --- approval: the wait times out, and (correction 3) another error does not read as a timeout
+  {
+    clearCounter();
+    const r = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id = (await r.json()).id;
+    script = [text(JSON.stringify({ queries: ["a", "b", "c", "d", "e", "f", "g"] }), { input_tokens: 10, output_tokens: 10 })];
+    const step = makeStep([]);   // nothing arrives: the stand-in throws its timeout
+    await runWorkflow(id, step);
+    const row = db.tasks.find((t) => t.id === id);
+    check("the wait timing out ends the task expired with reason timeout, and finish-failed still ran",
+          row.state === "expired" && row.reason === "timeout" && step.calls.at(-1).name === "finish-failed");
+
+    clearCounter();
+    const r2 = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id2 = (await r2.json()).id;
+    script = [text(JSON.stringify({ queries: ["a", "b", "c", "d", "e", "f", "g"] }), { input_tokens: 10, output_tokens: 10 })];
+    const step2 = makeStep([{ throw: Object.assign(new Error("engine restarted"), { name: "WorkflowError" }) }]);
+    await runWorkflow(id2, step2);
+    const row2 = db.tasks.find((t) => t.id === id2);
+    check("an error inside the wait that is not the timeout ends step_failed, not expired", row2.state === "failed" && row2.reason === "step_failed", `${row2.state}/${row2.reason}`);
+    check("isTimeout matches the name or the message and nothing else",
+          isTimeout({ name: "WorkflowTimeoutError" }) && isTimeout({ message: "Step timed out" }) && !isTimeout({ name: "TypeError", message: "boom" }));
+    check("durationMs reads the units Workflows accepts", durationMs("24 hours") === 24 * HOUR && durationMs("90 seconds") === 90000 && durationMs(5000) === 5000);
+  }
+
+  // --- take
+  {
+    const r = await post("/v1/tasks/take", deviceToken, { id: taskId });
+    const j = await r.json();
+    const row = db.tasks.find((t) => t.id === taskId);
+    check("take returns the result and the three-field ledger", r.status === 200 && j.state === "succeeded" && j.result.spoken.length > 0 && j.result.deliver.notes.title === "Swift actor reentrancy"
+          && j.steps.length === 6 && Object.keys(j.steps[0]).sort().join(",") === "cents,name,outcome");
+    const seenIndex = tasks.log.findIndex((l) => l.id === taskId && l.call === "delete");
+    check("take marked the row seen and then deleted the instance", row.seen_at === clock && seenIndex >= 0);
+    check("the header on that reply no longer counts it unseen", !header(r).includes(`${taskId}:succeeded`) && /unseen=\d/.test(header(r)));
+    const again = await post("/v1/tasks/take", deviceToken, { id: taskId });
+    check("take when the instance is already gone still answers 200", again.status === 200);
+    const running = db.tasks.find((t) => t.state === "running" || t.state === "created");
+    clearCounter();
+    const r3 = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id3 = (await r3.json()).id;
+    check("take on an unfinished task is not_finished", (await post("/v1/tasks/take", deviceToken, { id: id3 })).status === 409);
+    check("cancel on a running task terminates the instance and says the user did it",
+          (await post("/v1/tasks/cancel", deviceToken, { id: id3 })).status === 200
+          && tasks.log.some((l) => l.id === id3 && l.call === "terminate") && db.tasks.find((t) => t.id === id3).reason === "user");
+    check("cancel on a finished task is already_finished", (await post("/v1/tasks/cancel", deviceToken, { id: taskId })).status === 409);
+    void running;
+  }
+
+  // --- delete and list
+  {
+    clearCounter();
+    const r = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id = (await r.json()).id;
+    const d = await post("/v1/tasks/delete", deviceToken, { id });
+    check("delete on a running task terminates, removes the row and the instance",
+          d.status === 200 && tasks.log.some((l) => l.id === id && l.call === "terminate") && tasks.log.some((l) => l.id === id && l.call === "delete") && !db.tasks.some((t) => t.id === id));
+    check("and the header no longer lists it", !header(d).includes(id));
+    const terminatesBefore = tasks.log.filter((l) => l.call === "terminate").length;
+    const d2 = await post("/v1/tasks/delete", deviceToken, { id: taskId });
+    check("delete on a finished task removes it without terminating", d2.status === 200 && tasks.log.filter((l) => l.call === "terminate").length === terminatesBefore && !db.tasks.some((t) => t.id === taskId));
+    check("delete of an unknown id is not_found", (await post("/v1/tasks/delete", deviceToken, { id: "nope" })).status === 404);
+
+    const list = await post("/v1/tasks", deviceToken, {});
+    const lj = await list.json();
+    check("list returns the account's rows with state, question and spoken, never the input or the detail",
+          list.status === 200 && lj.tasks.length === db.tasks.filter((t) => t.account_id === accountId).length
+          && lj.tasks.every((t) => t.id && t.state && !("input" in t) && !("detail" in t) && !("result" in t))
+          && lj.tasks.some((t) => t.id === approvedId && t.spoken === "S"));
+    check("another account sees none of them", (await (await post("/v1/tasks", otherToken, {})).json()).tasks.length === 0);
+  }
+
+  // --- retention: a comparison at read
+  {
+    const old = db.tasks.find((t) => t.id === approvedId);
+    old.expires_at = clock - 1;
+    const young = db.tasks.find((t) => t.state === "failed");
+    young.expires_at = clock + 1;
+    const list = await post("/v1/tasks", deviceToken, {});
+    const lj = await list.json();
+    check("a finished row past expires_at is deleted when the rows are next read, and its instance with it",
+          !db.tasks.some((t) => t.id === approvedId) && tasks.log.some((l) => l.id === approvedId && l.call === "delete") && !lj.tasks.some((t) => t.id === approvedId));
+    check("a row still inside its retention stays", db.tasks.some((t) => t.id === young.id));
+    const cancelled = db.tasks.find((t) => t.reason === "user");
+    cancelled.state = "running"; cancelled.expires_at = clock - 1;
+    await post("/v1/tasks", deviceToken, {});
+    check("a non-terminal row is never swept", db.tasks.some((t) => t.id === cancelled.id));
+    cancelled.state = "cancelled";
+  }
+
+  // --- the question path: a header from KV, read beside the counters, never written
+  {
+    const reads = [];
+    const kvSpy = { ...kv, get: async (k) => { reads.push(k); return kv.get(k); } };
+    const before = [...kv.store.keys()].filter((k) => k.startsWith("tasks:")).map((k) => kv.store.get(k)).join("|");
+    const dbCalls = db.calls.length;
+    const ctx = makeCtx();
+    const response = await worker.fetch(ask(valid, deviceToken), { ...envTasks, OTTO: kvSpy }, ctx);
+    await ctx.settle();
+    const h = header(response);
+    check("a question's reply carries otto-tasks from the KV summary", response.status === 200 && h.startsWith("v=1;") && /unseen=[1-9]/.test(h) && h.includes(";s="), h);
+    const tasksRead = reads.indexOf(`tasks:${accountId}`);
+    const firstCounter = reads.findIndex((k) => k.startsWith(`u:${accountId}:`));
+    check("the summary was read in the same round trip as the counters", tasksRead >= 0 && firstCounter >= 0 && Math.abs(tasksRead - firstCounter) <= 2);
+    check("a question never writes the summary, never reads D1 and never touches the Workflow binding",
+          [...kv.store.keys()].filter((k) => k.startsWith("tasks:")).map((k) => kv.store.get(k)).join("|") === before && db.calls.length === dbCalls);
+    kv.store.delete(`tasks:${accountId}`);
+    const bare = await worker.fetch(ask(valid, deviceToken), envTasks, makeCtx());
+    check("with no summary in KV the header is absent, not zero", bare.headers.get("otto-tasks") === null);
+    const trial = await worker.fetch(ask(valid, trialToken), envTasks, makeCtx());
+    check("a trial's question reads no summary", !reads.some((k) => k === `tasks:${trialToken}`) && trial.status === 200);
+  }
+
+  // --- the header grammar and the summary
+  {
+    const t0 = 1_760_000_000_000;
+    const rows = [];
+    for (let i = 0; i < 10; i++) {
+      rows.push({ id: `id-${i}`, type: "research", state: "running", updated_at: t0 + i, seen_at: null });
+    }
+    rows[0] = { ...rows[0], state: "awaiting_approval", question: JSON.stringify({ spoken: "A; question: with=odd chars " + "x".repeat(300), until: t0 + 5 }), updated_at: t0 + 20 };
+    rows[1] = { ...rows[1], state: "awaiting_approval", question: JSON.stringify({ spoken: "Older question?", until: t0 + 5 }), updated_at: t0 + 19 };
+    rows[2] = { ...rows[2], state: "succeeded", result: JSON.stringify({ spoken: "Done one." }), updated_at: t0 + 18 };
+    rows[3] = { ...rows[3], state: "failed", reason: "max_duration", updated_at: t0 + 17 };
+    rows[4] = { ...rows[4], state: "succeeded", result: JSON.stringify({ spoken: "Done three." }), updated_at: t0 + 16 };
+    rows[5] = { ...rows[5], state: "succeeded", result: JSON.stringify({ spoken: "Seen already." }), seen_at: t0, updated_at: t0 + 15 };
+    const summary = summaryFromRows(rows, t0 + 100);
+    const h = tasksHeader(summary)["otto-tasks"];
+    const fields = h.split(";");
+    check("the header counts running, awaiting and unseen, and a seen result is not unseen",
+          fields.slice(0, 4).join(";") === "v=1;running=4;awaiting=2;unseen=3", fields.slice(0, 4).join(";"));
+    check("it lists at most eight ids, awaiting first", fields.filter((f) => f.startsWith("t=")).length === 8 && fields[4].startsWith("t=id-0:awaiting_approval:research"));
+    const q = fields.find((f) => f.startsWith("q="));
+    check("one q, the oldest awaiting, cut at 240 and percent-encoded", q && q.startsWith("q=id-1:") && decodeURIComponent(q.slice("q=id-1:".length)) === "Older question?");
+    const long = tasksHeader(summaryFromRows([rows[0]], t0))["otto-tasks"];
+    const longQ = long.split(";").find((f) => f.startsWith("q=")).slice("q=id-0:".length);
+    check("a long sentence is cut before encoding and its separators survive the encoding", decodeURIComponent(longQ).length === 240 && !longQ.includes(";") && !longQ.includes("="));
+    const s = fields.filter((f) => f.startsWith("s="));
+    check("at most two s, the newest unseen first, a failure carrying its fixed sentence",
+          s.length === 2 && decodeURIComponent(s[0].slice("s=id-2:".length)) === "Done one." && decodeURIComponent(s[1].slice("s=id-3:".length)) === "The research ran out of time.", s.join(" "));
+    check("the whole header stays under 1,500 bytes", new TextEncoder().encode(h).byteLength < 1500, String(new TextEncoder().encode(h).byteLength));
+    check("no rows is present with zeros", tasksHeader(summaryFromRows([], t0))["otto-tasks"] === "v=1;running=0;awaiting=0;unseen=0");
+    check("research is bounded to its maxSteps on the longest path: plan, twelve searches, draft, start and finish",
+          1 + 1 + 12 + 1 + 1 + 2 <= TYPES.research.maxSteps);   // start, plan, 12 searches, ask-write/ask-read, draft, finish
+  }
+
+  Date.now = realNow;
+  globalThis.fetch = async () => anthropicDone();
+}
+
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
