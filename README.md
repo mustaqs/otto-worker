@@ -26,8 +26,11 @@ an implementation that buffers.
 
 **It counts requests, not tokens.** Counting output tokens would mean reading
 the response body, which is the single most likely way to reintroduce
-buffering. Counting requests means the Worker never touches a response at all,
-so pass-through streaming holds by construction rather than by care.
+buffering. Counting requests means the Worker never reads a response body on
+the question path, so pass-through streaming holds by construction rather than
+by care. A task step (A82, below) is a different path and must read the
+model's answer and its usage; that is the second and last reader of the key,
+and `Bench/check-task-path.sh` asserts there is no third.
 
 The tradeoff, stated so nobody sets a cap while guessing: this bounds the
 *number* of requests, not the cost of each. A request carries roughly a
@@ -205,6 +208,49 @@ parse order, that no tool route reaches Supabase, that no log line interpolates
 arguments or results, and that `src/tools.js` — the mapping from Otto's
 slim tools to Composio's actions, and the connect-time default lookups — is
 pure.
+
+## Tasks (A82)
+
+Long-running work — minutes of steps, an hour's wait for a yes — runs on the
+relay as a Cloudflare Workflow and is delivered on the user's next question or
+panel open. Six routes, none of them the question path; every reply carries
+`otto-tasks`:
+
+    POST /v1/tasks/create   { type, request, context?, document?, now, tz } → 200 { id, state: "created" }
+    POST /v1/tasks/approve  { id, decision: "approve" | "decline" }        → 200 { id, state }
+    POST /v1/tasks/cancel   { id }                                           → 200 { id, state: "cancelled" }
+    POST /v1/tasks/take     { id }                                           → 200 { id, type, state, reason?, result?, steps }
+    POST /v1/tasks/delete   { id }                                           → 200 {}
+    POST /v1/tasks          {}                                               → 200 { tasks: [...] }
+
+`otto-tasks` is `v=1;running=1;awaiting=0;unseen=1;t=<id>:<state>:<type>;…;q=<id>:<sentence>;s=<id>:<sentence>`:
+counts, up to eight ids, the one pending question's sentence and up to two
+unseen results' sentences, percent-encoded. On tool and panel replies it is
+computed from D1 and exact. On the question reply it comes from one KV key
+per account, `tasks:<account>`, which the Workflow and the task routes rewrite
+from D1 after every transition and which `checkLimits` reads beside the
+counters — read and never written there, at KV's sixty-second edge cache.
+**Absent means no information; present with zeros means none.**
+
+The row in D1 is the truth and the Workflow instance with the same id is the
+engine. A task is bounded by its type's `maxDurationMs` — the platform has no
+cap of its own — and the comparison runs inside every step; time spent
+waiting for an approval is recorded on the row and forgiven. Retention is a
+comparison at read: a finished row seven days old is deleted when the
+account's rows are next read, and the instance keeps the same seven days and
+is deleted when the result is taken. Refusals: `needs_account` for a trial
+device, `unknown_type`, `document_not_allowed`, `task_limit` past the plan's
+`task_cap` (zero means no gate; `free` is 5 a day as a placeholder),
+`not_awaiting`, `already_finished`, `not_finished`, `task_not_started`.
+
+The one type so far is `research`: plan, up to twelve direct web searches on
+`claude-sonnet-5`, a draft, a note for the app to file. It asks once at most,
+before spending more than six searches. Setup, out of band:
+
+    wrangler d1 migrations apply otto --remote    # 0005_tasks.sql
+    wrangler deploy                               # registers the otto-tasks Workflow from [[workflows]]
+
+The Workflow runs under the same `ANTHROPIC_API_KEY`; no new secret.
 
 ## Tests
 

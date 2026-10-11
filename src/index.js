@@ -17,6 +17,18 @@ import {
   looksLikeLostAuthorization, verifyWebhookSignature,
   NeedsDetail, DEFAULT_LOOKUPS, defaultsFromReplies,
 } from "./tools.js";
+// Long-running tasks (SPEC.md A82). The registry and the header composer are
+// pure; run.js holds the D1 helpers the task routes share with the Workflow.
+// None of this is on the question path except the one pure header composer,
+// which checkLimits feeds from a KV key — Bench/check-task-path.sh.
+import {
+  TYPES, TASK_VERSION, CREATE_KEYS, REQUEST_MAX_CHARS, CONTEXT_MAX_CHARS, DOCUMENT_MAX_BYTES,
+} from "./tasks/registry.js";
+import { tasksHeader, TERMINAL } from "./tasks/summary.js";
+import {
+  insertRow, readRow, deleteRow, markState, finishTask, taskRows, writeSummary,
+  tasksHeaderFor, deleteInstance, terminateInstance,
+} from "./tasks/run.js";
 
 const ANTHROPIC = "https://api.anthropic.com/v1/messages";
 const COMPOSIO = "https://backend.composio.dev/api/v3.1";
@@ -68,6 +80,15 @@ export default {
     if (url.pathname === "/v1/integrations/link") return integrationsLink(request, env);
     if (url.pathname === "/v1/integrations/unlink") return integrationsUnlink(request, env);
     if (url.pathname === "/v1/integrations/webhook") return integrationsWebhook(request, env);
+    // Tasks (A82): six routes, none of them the question path. D1 and the
+    // Workflow binding are reached from these and from the Workflow itself;
+    // a question reads one KV key and nothing else — Bench/check-task-path.sh.
+    if (url.pathname === "/v1/tasks/create") return createTask(request, env);
+    if (url.pathname === "/v1/tasks/approve") return approveTask(request, env);
+    if (url.pathname === "/v1/tasks/cancel") return cancelTask(request, env);
+    if (url.pathname === "/v1/tasks/take") return takeTask(request, env);
+    if (url.pathname === "/v1/tasks/delete") return deleteTask(request, env);
+    if (url.pathname === "/v1/tasks") return listTasks(request, env);
 
     if (url.pathname !== "/v1/ask") return problem(404, "not_found");
 
@@ -199,6 +220,10 @@ export default {
       status: 200,
       headers: {
         ...gate.usage,
+        // `otto-tasks` (A82), from the KV summary checkLimits already read
+        // beside the counters. Absent when there is no summary: the app
+        // reads absence as "no information", never as "no tasks".
+        ...gate.tasks,
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache, no-store",
         "connection": "keep-alive",
@@ -418,19 +443,31 @@ async function checkLimits(env, account, timing = {}) {
   const now = new Date();
   // KEYED ON THE SUBJECT, NOT THE TOKEN. Two devices on one account share one
   // quota, which is what a subscription means to the person paying for it.
-  const { dayKey, hourKey, totalKey } = counterKeys(account.subject, now);
+  const { dayKey, hourKey, totalKey, tasksKey } = counterKeys(account.subject, now);
   const onTrial = account.kind === "trial" && account.trialCap > 0;
 
+  // THE TASK SUMMARY RIDES IN THE SAME ROUND TRIP (A82). One more KV key,
+  // read beside the counters inside the one Promise.all, so a question
+  // learns of a finished task with no new request, no new binding and no
+  // added latency — at KV's sixty-second edge cache, which A26 records. READ
+  // AND NEVER WRITTEN HERE: the Workflow and the task routes rewrite it from
+  // D1, and Bench/check-task-path.sh asserts this function has no put of it.
+  // A trial has no account and so no tasks; its read is skipped.
   const tRead = Date.now();
-  const [dayRaw, hourRaw, totalRaw] = await Promise.all([
+  const [dayRaw, hourRaw, totalRaw, tasksRaw] = await Promise.all([
     env.OTTO.get(dayKey),
     env.OTTO.get(hourKey),
     onTrial ? env.OTTO.get(totalKey) : Promise.resolve(null),
+    onTrial ? Promise.resolve(null) : env.OTTO.get(tasksKey),
   ]);
   timing.counterRead = Date.now() - tRead;
   const dayCount = Number(dayRaw) || 0;
   const hourCount = Number(hourRaw) || 0;
   const totalCount = Number(totalRaw) || 0;
+  let tasks = {};
+  if (tasksRaw) {
+    try { tasks = tasksHeader(JSON.parse(tasksRaw)); } catch { tasks = {}; }
+  }
 
   // The hourly limit is the real protection against a runaway bill: a daily cap
   // can still be burned through in a minute by a loop.
@@ -460,19 +497,19 @@ async function checkLimits(env, account, timing = {}) {
   //
   // No retryAfter: there is no time at which this resolves itself.
   if (onTrial && totalCount >= account.trialCap) {
-    return { refused: problem(403, "trial_exhausted", {}, usage(false)) };
+    return { refused: problem(403, "trial_exhausted", {}, { ...usage(false), ...tasks }) };
   }
 
   if (account.hourlyCap > 0 && hourCount >= account.hourlyCap) {
     return {
       refused: problem(429, "hourly_limit",
-                       { retryAfter: secondsToNextHour(now) }, usage(false)),
+                       { retryAfter: secondsToNextHour(now) }, { ...usage(false), ...tasks }),
     };
   }
   if (account.dailyCap > 0 && dayCount >= account.dailyCap) {
     return {
       refused: problem(429, "daily_limit",
-                       { retryAfter: secondsToNextDay(now) }, usage(false)),
+                       { retryAfter: secondsToNextDay(now) }, { ...usage(false), ...tasks }),
     };
   }
 
@@ -480,6 +517,7 @@ async function checkLimits(env, account, timing = {}) {
   return {
     refused: null,
     usage: usage(true),
+    tasks,
     commit: () =>
       Promise.all([
         env.OTTO.put(dayKey, String(dayCount + 1), { expirationTtl: 60 * 60 * 48 }),
@@ -539,6 +577,11 @@ function counterKeys(subject, now) {
     dayKey: `u:${subject}:d:${day}`,
     hourKey: `u:${subject}:h:${hour}`,
     totalKey: `u:${subject}:total`,
+    // The account's task summary (A82): written by the Workflow and the task
+    // routes, read by the question path. The one `tasks:` literal in this file.
+    tasksKey: `tasks:${subject}`,
+    // The task day counter (A82), the shape of the tool counter in runTool.
+    taskDayKey: `u:${subject}:k:${day}`,
   };
 }
 
@@ -913,7 +956,9 @@ async function runTool(request, env) {
     console.error("integration rows unreadable:", String(error && error.message));
     return problem(503, "not_provisioned");
   }
-  const headers = integrationsHeader(rows);
+  // Both headers on every tool reply: the apps' states, and the tasks' (A82),
+  // exact from D1 on a route that already reads it.
+  const headers = { ...integrationsHeader(rows), ...(await safeTasksHeader(env, accountId)) };
   const row = rows.find((r) => r.app === spec.app);
   if (!row || row.state !== "active") {
     return problem(403, "needs_signin", { app: spec.app }, headers);
@@ -949,7 +994,7 @@ async function runTool(request, env) {
       await markIntegration(env, accountId, spec.app, "expired");
       console.error(`tool ${tool}: the ${spec.app} authorization has lapsed`);
       return problem(403, "needs_signin", { app: spec.app },
-                     integrationsHeader(rows.map((r) => (r.app === spec.app ? { ...r, state: "expired" } : r))));
+                     { ...headers, ...integrationsHeader(rows.map((r) => (r.app === spec.app ? { ...r, state: "expired" } : r))) });
     }
     // CLASSIFIED ON THE NUMBER, NEVER THE TEXT (A58's rule; A77, from the
     // first run). Composio's `data.status_code` is the app's own HTTP status:
@@ -968,11 +1013,11 @@ async function runTool(request, env) {
   return json200({ ok: true, result, id }, headers);
 }
 
-/** The plan row with its tool cap. Never called from the question path. */
+/** The plan row with its tool and task caps. Never called from the question path. */
 async function loadPlanCaps(env, name) {
   try {
     return await env.DB.prepare(
-      `SELECT name, daily_cap, hourly_cap, trial_cap, tool_cap FROM plans WHERE name = ?`
+      `SELECT name, daily_cap, hourly_cap, trial_cap, tool_cap, task_cap FROM plans WHERE name = ?`
     ).bind(name).first();
   } catch (error) {
     console.error("plan lookup failed:", String(error && error.message));
@@ -1063,7 +1108,10 @@ async function integrationsStatus(request, env) {
   }
   const apps = Object.fromEntries(APPS.map((a) => [a, "none"]));
   for (const row of rows) apps[row.app] = row.state;
-  return json200({ apps, account: true }, integrationsHeader(rows));
+  // The panel opens on this request (A78), so it is where a finished task
+  // reaches a user who has not asked a question since (A82).
+  return json200({ apps, account: true },
+                 { ...integrationsHeader(rows), ...(await safeTasksHeader(env, auth.account.subject)) });
 }
 
 /**
@@ -1256,6 +1304,256 @@ async function integrationsWebhook(request, env) {
     }
   }
   return json200({});
+}
+
+// -------------------------------------------------------------------- tasks
+
+/**
+ * Long-running tasks (SPEC.md A82): six routes, none of them the question
+ * path. A task is a D1 row and a Workflow instance with the same id; the row
+ * is the truth, the instance is the engine, and src/tasks/run.js is what
+ * passes between them. The task routes write the row, speak to the instance
+ * (create, sendEvent, terminate, delete) and rewrite the KV summary; the
+ * Workflow does the same from inside its steps.
+ *
+ * WHO A TASK BELONGS TO: the account subject, as a tool does. A trial device
+ * is refused with `needs_account` before anything is read. Every row read
+ * names the account, so another account's id is `not_found`.
+ *
+ * WHAT IS NEVER LOGGED: the request, the context, the document, the
+ * question, the result. Lines carry a type, a state, a reason word.
+ */
+
+/** The task header for a route that already reads D1. A D1 failure here loses the header, not the reply. */
+async function safeTasksHeader(env, accountId) {
+  try { return await tasksHeaderFor(env, accountId); } catch (error) {
+    console.error(`task header not computed (${error && error.name ? error.name : "error"})`);
+    return {};
+  }
+}
+
+/**
+ * POST /v1/tasks/create  { type, request, context?, document?, now, tz }  →  200 { id, state: "created" } + otto-tasks
+ *
+ * In order: the bearer must have an account; the body must carry only the
+ * six allowed keys — an allowlist, so an image never arrives under a name of
+ * its own (A60); the type must be in the registry and the request bounded;
+ * the document only for a type that declares it; the task counter under the
+ * plan's cap, counted BEFORE the create so a create that fails still counts;
+ * then the row, then the instance with the same id and the same retention
+ * the row has.
+ */
+async function createTask(request, env) {
+  const auth = await authenticateAccount(request, env);
+  if (auth.refused) return auth.refused;
+  const accountId = auth.account.subject;
+
+  let body;
+  try { body = await request.json(); } catch { return problem(400, "malformed_json"); }
+  if (!body || typeof body !== "object") return problem(400, "bad_request");
+  for (const key of Object.keys(body)) if (!CREATE_KEYS.includes(key)) return problem(400, "bad_request", { key });
+
+  const type = typeof body.type === "string" ? body.type : "";
+  const entry = TYPES[type];
+  if (!entry) return problem(400, "unknown_type");
+
+  const text = typeof body.request === "string" ? body.request.trim() : "";
+  if (!text || text.length > REQUEST_MAX_CHARS) return problem(400, "bad_request", { field: "request" });
+  const context = typeof body.context === "string" ? body.context.trim().slice(0, CONTEXT_MAX_CHARS) : "";
+  const now = typeof body.now === "string" && !Number.isNaN(new Date(body.now).getTime()) ? body.now : null;
+  if (!now) return problem(400, "bad_request", { field: "now" });
+  const tz = typeof body.tz === "string" && body.tz ? body.tz.slice(0, 64) : "UTC";
+  let document;
+  if (body.document !== undefined) {
+    if (!entry.needsDocument) return problem(400, "document_not_allowed");
+    if (typeof body.document !== "string" || new TextEncoder().encode(body.document).byteLength > DOCUMENT_MAX_BYTES) {
+      return problem(400, "document_not_allowed");
+    }
+    document = body.document;
+  }
+
+  if (!env.TASKS) {
+    console.error("tasks are not provisioned: the TASKS binding is missing");
+    return problem(503, "not_provisioned");
+  }
+
+  // The task cap, from the plan row, counted before the create (like tools).
+  const plan = await loadPlanCaps(env, auth.account.plan);
+  const taskCap = plan ? Number(plan.task_cap) || 0 : 0;
+  const { taskDayKey } = counterKeys(accountId, new Date());
+  const used = Number(await env.OTTO.get(taskDayKey)) || 0;
+  if (taskCap > 0 && used >= taskCap) return problem(429, "task_limit", {}, await safeTasksHeader(env, accountId));
+  await env.OTTO.put(taskDayKey, String(used + 1), { expirationTtl: 60 * 60 * 48 });
+
+  const id = crypto.randomUUID();
+  const createdAt = Date.now();
+  const input = { request: text, ...(context ? { context } : {}), ...(document !== undefined ? { document } : {}), now, tz, taskVersion: TASK_VERSION };
+  try {
+    await insertRow(env, { id, accountId, type, input, createdAt });
+  } catch (error) {
+    console.error("task row not written:", String(error && error.name || "error"));
+    return problem(503, "not_provisioned");
+  }
+
+  // THE INSTANCE, with the row's id and the row's retention. If the platform
+  // refuses, the row goes: a task the user cannot see must not linger.
+  try {
+    await env.TASKS.create({
+      id,
+      params: { type, accountId, input, taskVersion: TASK_VERSION },
+      retention: { successRetention: entry.retention, errorRetention: entry.retention },
+    });
+  } catch (error) {
+    console.error(`task instance not created for ${type} (${error && error.name ? error.name : "error"})`);
+    await deleteRow(env, { id, accountId });
+    return problem(502, "task_not_started", {}, await safeTasksHeader(env, accountId));
+  }
+  await writeSummary(env, accountId);
+  console.log(`task ${type} created`);
+  return json200({ id, state: "created" }, await safeTasksHeader(env, accountId));
+}
+
+/** The row named in the body, for this account, or the refusal. */
+async function taskFromBody(request, env) {
+  const auth = await authenticateAccount(request, env);
+  if (auth.refused) return { refused: auth.refused };
+  let body;
+  try { body = await request.json(); } catch { return { refused: problem(400, "malformed_json") }; }
+  const id = body && typeof body.id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(body.id) ? body.id : "";
+  if (!id) return { refused: problem(400, "bad_request", { field: "id" }) };
+  const task = { id, accountId: auth.account.subject };
+  let row;
+  try { row = await readRow(env, task); } catch (error) {
+    console.error("task row unreadable:", String(error && error.name || "error"));
+    return { refused: problem(503, "not_provisioned") };
+  }
+  if (!row) return { refused: problem(404, "not_found") };
+  return { auth, body, task, row };
+}
+
+/**
+ * POST /v1/tasks/approve  { id, decision: "approve" | "decline" }  →  200 { id, state } + otto-tasks
+ *
+ * Only a row that is awaiting may be answered; the answer is written, then
+ * the event is sent to the instance, which is waiting on exactly this type.
+ * If the instance cannot take it, the row is failed rather than left saying
+ * "approved" over a Workflow that will never move.
+ */
+async function approveTask(request, env) {
+  const found = await taskFromBody(request, env);
+  if (found.refused) return found.refused;
+  const { body, task, row } = found;
+  const decision = body.decision === "approve" || body.decision === "decline" ? body.decision : "";
+  if (!decision) return problem(400, "bad_request", { field: "decision" });
+  if (row.state !== "awaiting_approval") return problem(409, "not_awaiting", { state: row.state }, await safeTasksHeader(env, task.accountId));
+
+  const state = decision === "approve" ? "approved" : "declined";
+  await markState(env, task, state, { answer: { decision, at: Date.now() } });
+  try {
+    const instance = await env.TASKS.get(task.id);
+    await instance.sendEvent({ type: "approval", payload: { decision } });
+  } catch (error) {
+    console.error(`task approval not delivered (${error && error.name ? error.name : "error"})`);
+    await finishTask(env, task, "failed", { reason: "step_failed" });
+    return problem(502, "task_failed", {}, await safeTasksHeader(env, task.accountId));
+  }
+  console.log(`task ${row.type} ${state}`);
+  return json200({ id: task.id, state }, await safeTasksHeader(env, task.accountId));
+}
+
+/**
+ * POST /v1/tasks/cancel  { id }  →  200 { id, state: "cancelled" } + otto-tasks
+ *
+ * The instance is terminated, best effort, and the row says the user did it.
+ */
+async function cancelTask(request, env) {
+  const found = await taskFromBody(request, env);
+  if (found.refused) return found.refused;
+  const { task, row } = found;
+  if (TERMINAL.has(row.state)) return problem(409, "already_finished", { state: row.state }, await safeTasksHeader(env, task.accountId));
+  await terminateInstance(env, task.id);
+  await finishTask(env, task, "cancelled", { reason: "user" });
+  console.log(`task ${row.type} cancelled`);
+  return json200({ id: task.id, state: "cancelled" }, await safeTasksHeader(env, task.accountId));
+}
+
+/**
+ * POST /v1/tasks/take  { id }  →  200 { id, type, state, reason?, result?, steps } + otto-tasks
+ *
+ * The one request the delivering chord causes: the detail no header could
+ * carry, the row marked seen, and the instance deleted — the result is in the
+ * row now, so the platform's copy has nothing left to do.
+ */
+async function takeTask(request, env) {
+  const found = await taskFromBody(request, env);
+  if (found.refused) return found.refused;
+  const { task, row } = found;
+  if (!TERMINAL.has(row.state)) return problem(409, "not_finished", { state: row.state }, await safeTasksHeader(env, task.accountId));
+  await markSeen(env, task);
+  await deleteInstance(env, task.id);
+  let result = null;
+  try { result = row.result ? JSON.parse(row.result) : null; } catch { result = null; }
+  let steps = [];
+  try { steps = JSON.parse(row.steps || "[]"); } catch { steps = []; }
+  const ledger = (Array.isArray(steps) ? steps : []).map((s) => ({ name: s.name, outcome: s.outcome, cents: s.cents ?? 0 }));
+  console.log(`task ${row.type} taken (${row.state})`);
+  return json200({ id: task.id, type: row.type, state: row.state, reason: row.reason || undefined, result, steps: ledger },
+                 await safeTasksHeader(env, task.accountId));
+}
+
+async function markSeen(env, task) {
+  await env.DB.prepare(`UPDATE tasks SET seen_at = ?, updated_at = ? WHERE id = ? AND account_id = ?`)
+    .bind(Date.now(), Date.now(), task.id, task.accountId).run();
+  await writeSummary(env, task.accountId);
+}
+
+/**
+ * POST /v1/tasks/delete  { id }  →  200 {} + otto-tasks
+ *
+ * The user's deletion: a running instance is terminated first, then the row
+ * and the instance go. Retention does the same on its own clock.
+ */
+async function deleteTask(request, env) {
+  const found = await taskFromBody(request, env);
+  if (found.refused) return found.refused;
+  const { task, row } = found;
+  if (!TERMINAL.has(row.state)) await terminateInstance(env, task.id);
+  await deleteRow(env, task);
+  await deleteInstance(env, task.id);
+  await writeSummary(env, task.accountId);
+  console.log(`task ${row.type} deleted`);
+  return json200({}, await safeTasksHeader(env, task.accountId));
+}
+
+/**
+ * POST /v1/tasks  {}  →  200 { tasks: [...] } + otto-tasks
+ *
+ * For the tab (A83): every row of the account, newest first, with the
+ * question and the spoken sentence where there is one — never the input,
+ * never the detail. Reading the rows is also when retention runs.
+ */
+async function listTasks(request, env) {
+  const auth = await authenticateAccount(request, env);
+  if (auth.refused) return auth.refused;
+  const accountId = auth.account.subject;
+  let rows;
+  try { rows = await taskRows(env, accountId); } catch (error) {
+    console.error("task rows unreadable:", String(error && error.name || "error"));
+    return problem(503, "not_provisioned");
+  }
+  const tasks = rows.map((row) => {
+    let question = null, result = null;
+    try { question = row.question ? JSON.parse(row.question) : null; } catch { question = null; }
+    try { result = row.result ? JSON.parse(row.result) : null; } catch { result = null; }
+    return {
+      id: row.id, type: row.type, state: row.state, reason: row.reason || undefined,
+      createdAt: row.created_at, updatedAt: row.updated_at, finishedAt: row.finished_at || undefined,
+      seen: row.seen_at != null,
+      question: question ? { spoken: question.spoken, until: question.until } : undefined,
+      spoken: result && result.spoken ? result.spoken : undefined,
+    };
+  });
+  return json200({ tasks }, await safeTasksHeader(env, accountId));
 }
 
 // -------------------------------------------------------------- validation
