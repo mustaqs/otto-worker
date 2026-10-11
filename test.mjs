@@ -8,6 +8,9 @@
 import worker from "./src/index.js";
 
 let failures = 0;
+// A parked promise with nothing else pending drains node's loop and the file
+// ends with no summary; say so instead, and fail.
+process.on("beforeExit", () => { process.stdout.write("\nFAIL the event loop drained before the summary: a test is parked\n"); process.exit(1); });
 const check = (name, ok, detail = "") => {
   console.log(`  ${ok ? "ok  " : "FAIL"} ${name}${ok || !detail ? "" : "  — " + detail}`);
   if (!ok) failures++;
@@ -1085,21 +1088,30 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
   };
 
   // A step stand-in: runs the callback at once, retries once on an ordinary
-  // throw, never on NonRetryableError; waits resolve from a queue. It rethrows
-  // the way the engine does — a fresh error carrying only the name and the
-  // message — because the live run of 2026-10-11 showed that a property set on
-  // the error inside the callback does not reach the caller of step.do.
-  const engineThrow = (error) => Object.assign(new Error(error && error.message ? error.message : String(error)), { name: error && error.name ? error.name : "Error" });
+  // throw, never on NonRetryableError; waits resolve from a queue. Two things
+  // it copies from the engine, both measured on the live runs of 2026-10-11:
+  //   - it rethrows a fresh Error whose message is "<name>: <message>" and
+  //     nothing else — a property set on the error inside the callback does
+  //     not reach the caller of step.do, and the message arrives prefixed;
+  //   - a step's output is cached by name, and an event `{ hibernate: true }`
+  //     makes the wait never resolve, so the test can start run() again on the
+  //     same stand-in the way the engine replays it after a hibernated wait:
+  //     every finished step returns its cached output without running, and
+  //     nothing computed outside a step survives.
+  const engineThrow = (error) => new Error(`${error && error.name ? error.name : "Error"}: ${error && error.message ? error.message : String(error)}`);
   const makeStep = (events = []) => {
     const calls = [];
+    const cache = new Map();
     return {
-      calls, events,
+      calls, events, cache,
       async do(name, config, fn) {
         if (typeof config === "function") { fn = config; config = {}; }
+        if (cache.has(name)) { calls.push({ name, config, cached: true }); return cache.get(name); }
         calls.push({ name, config });
-        try { return await fn(); } catch (error) {
+        const run = async () => { const out = await fn(); cache.set(name, out); return out; };
+        try { return await run(); } catch (error) {
           if (error && error.name === "NonRetryableError") throw engineThrow(error);
-          if (config && config.retries && config.retries.limit > 0) { calls.push({ name, config, retry: true }); return await fn(); }
+          if (config && config.retries && config.retries.limit > 0) { calls.push({ name, config, retry: true }); return await run(); }
           throw engineThrow(error);
         }
       },
@@ -1107,6 +1119,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
         calls.push({ name, config: options, wait: true });
         const next = events.shift();
         if (!next) throw Object.assign(new Error("Timeout: event not received"), { name: "WorkflowTimeoutError" });
+        if (next.hibernate) return new Promise(() => {});
         if (next.throw) throw next.throw;
         if (next.before) await next.before();
         return { type: options.type, payload: next.payload, timestamp: new Date(clock) };
@@ -1388,6 +1401,55 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     check("a bad decision is bad_request", (await post("/v1/tasks/approve", deviceToken, { id, decision: "maybe" })).status === 400);
   }
 
+  // --- approval across a hibernated wait: the engine replays run() from the top
+  {
+    clearCounter();
+    const r = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id = (await r.json()).id;
+    const eight = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    script = [text(JSON.stringify({ queries: eight }), { input_tokens: 10, output_tokens: 10 })];
+    script[0].before = () => advance(2 * MIN);
+    for (const q of eight) script.push(searchReply(`found ${q}`, 1));
+    script.push(text(JSON.stringify({ title: "T", spoken: "S", body: "B" }), { input_tokens: 10, output_tokens: 10 }));
+    modelCalls.length = 0; logged.length = 0;
+    const step = makeStep([{ hibernate: true }, { payload: { decision: "approve" } }]);
+    // The first run parks at the wait and is abandoned, as the engine abandons
+    // its isolate. Not through capture(): its finally would never run and the
+    // console would stay swapped for the rest of this file.
+    const realLog = console.log, realError = console.error;
+    console.log = () => {}; console.error = (...a) => logged.push(a.map(String).join(" "));
+    const created = tasks.created.find((c) => c.id === id);
+    runTask({ event: { payload: created.params, timestamp: new Date(db.tasks.find((t) => t.id === id).created_at), instanceId: id }, step, env: envTasks, NonRetryableError });
+    for (let i = 0; i < 200 && db.tasks.find((t) => t.id === id).state !== "awaiting_approval"; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    console.log = realLog; console.error = realError;
+    const parked = { ...db.tasks.find((t) => t.id === id) };
+    advance(2 * HOUR + 58 * MIN);                          // three hours pass with nothing in memory
+    await post("/v1/tasks/approve", deviceToken, { id, decision: "approve" });
+    await runWorkflow(id, step);                           // the replay: start, plan and ask-write come from the cache
+    const row = db.tasks.find((t) => t.id === id);
+    const askedAt = JSON.parse(parked.question).askedAt;
+    check("the replay re-ran nothing that had finished: one plan call, and start, plan and ask-write served from the cache",
+          parked.state === "awaiting_approval" && modelCalls.length === 1 + 8 + 1
+          && step.calls.filter((c) => c.cached).map((c) => c.name).join(",") === "start,plan,ask-write", step.calls.map((c) => c.name + (c.cached ? "*" : "")).join(","));
+    check("the wait's start survived the replay: waited_ms is the three hours, measured from the question's askedAt and not from the replay's clock",
+          row.waited_ms >= 2 * HOUR + 58 * MIN && row.waited_ms < 3 * HOUR && clock - askedAt === row.waited_ms, `${row.waited_ms} vs ${clock - askedAt}`);
+    check("asked at minute 2, hibernated, approved at hour 3 on a replay: the run continued and succeeded", row.state === "succeeded", `${row.state}/${row.reason}`);
+  }
+
+  // --- the engine's message prefix: a max_duration thrown inside a step still reads max_duration
+  {
+    clearCounter();
+    const r = await post("/v1/tasks/create", deviceToken, goodBody);
+    const id = (await r.json()).id;
+    script = [text(JSON.stringify({ queries: ["one"] }), { input_tokens: 10, output_tokens: 10 })];
+    script[0].before = () => advance(31 * MIN);
+    const step = makeStep();
+    await runWorkflow(id, step);
+    const row = db.tasks.find((t) => t.id === id);
+    check("the reason is max_duration although the caller of step.do saw the message prefixed by the error's name",
+          row.state === "failed" && row.reason === "max_duration", `${row.state}/${row.reason}`);
+  }
+
   // --- approval: declined
   {
     clearCounter();
@@ -1553,5 +1615,6 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
   globalThis.fetch = async () => anthropicDone();
 }
 
+process.removeAllListeners("beforeExit");
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

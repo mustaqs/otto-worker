@@ -69,7 +69,8 @@ export async function runTask({ event, step, env, NonRetryableError }) {
     await finalStep(step, "finish", () => finishTask(env, task, "succeeded", { result: entry.render(out, task.input) }));
   } catch (error) {
     const message = String(error && error.message ? error.message : "");
-    const reason = message.startsWith("max_duration") ? "max_duration"
+    // The engine prefixes the message with the error's name ("NonRetryableError: max_duration before …"), so the word is searched, not the start.
+    const reason = /\bmax_duration\b/.test(message) ? "max_duration"
       : error && error.name === "TaskDeclined" ? "declined"
       : error && error.name === "TaskExpired" ? "timeout"
       : "step_failed";
@@ -130,24 +131,31 @@ function finalStep(step, name, fn) {
  * maps only the timeout to `expired`.
  */
 async function askUser({ step, env, task, entry }, spoken) {
-  const askedAt = Date.now();
-  const until = askedAt + durationMs(entry.approvalTimeout);
-  await step.do("ask-write", { timeout: "1 minute" }, () =>
-    markState(env, task, "awaiting_approval", { question: { spoken: String(spoken || "").slice(0, 240), askedAt, until } }));
+  // THE WAIT'S START IS A STEP'S OUTPUT, never a local. After a hibernated
+  // wait the engine replays run() from the top and only step outputs survive:
+  // a `Date.now()` taken here would be the replay's time, the wait would be
+  // recorded as milliseconds, and the clock would not forgive it — the live
+  // run of 2026-10-11 recorded waited_ms 64 for a 34-minute wait and ran out.
+  const asked = await step.do("ask-write", { timeout: "1 minute" }, async () => {
+    const askedAt = Date.now();
+    const until = askedAt + durationMs(entry.approvalTimeout);
+    await markState(env, task, "awaiting_approval", { question: { spoken: String(spoken || "").slice(0, 240), askedAt, until } });
+    return { askedAt, until };
+  });
   let event;
   try {
-    event = await step.waitForEvent("ask-wait", { type: "approval", timeout: `${until - askedAt} ms` });
+    event = await step.waitForEvent("ask-wait", { type: "approval", timeout: `${asked.until - asked.askedAt} ms` });
   } catch (error) {
     const expired = isTimeout(error);
     const word = expired ? "TaskExpired" : errorWord(error);
     console.error(`task ${task.type} step ask-wait failed: ${word}`);
-    await recordStep(env, task, { name: "ask-wait", started: askedAt, ended: Date.now(), outcome: "failed", error: word });
+    await recordStep(env, task, { name: "ask-wait", started: asked.askedAt, ended: Date.now(), outcome: "failed", error: word });
     if (expired) throw Object.assign(new Error("timeout"), { name: "TaskExpired" });
     throw error;
   }
   const decision = event && event.payload && event.payload.decision === "approve" ? "approve" : "decline";
   await step.do("ask-read", { timeout: "1 minute" }, () =>
-    markState(env, task, decision === "approve" ? "running" : "declined", { waitedMs: Date.now() - askedAt }));
+    markState(env, task, decision === "approve" ? "running" : "declined", { waitedMs: Date.now() - asked.askedAt }));
   if (decision === "decline") throw Object.assign(new Error("declined"), { name: "TaskDeclined" });
   return decision;
 }

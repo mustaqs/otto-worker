@@ -699,6 +699,17 @@ test file.
   `TYPES.research.retention`, `RETENTION_MS`) and A82's sentence says three.
   The other Free limits a step must live inside: 10 ms CPU per step, 1,024
   steps per instance, 3,000 steps a day across the account.
+- **What the engine hands back, measured 2026-10-11.** Three things the
+  docs read on 2026-10-10 did not say, each now copied by the test's step
+  stand-in and pinned by a bench check: (1) an error thrown inside `step.do`
+  reaches the caller as a fresh `Error` whose message is `"<name>: <message>"`,
+  nothing else — no property survives, so the failed step writes its own
+  ledger entry before it throws and the reason word is searched in the
+  message, not matched at its start; (2) after a hibernated `waitForEvent`
+  the engine replays `run()` from the top with every finished step served
+  from its cached output, so nothing computed outside a step survives — the
+  wait's start is the ask-write step's output; (3) `waitForEvent` across a
+  34-minute wait resolved with the payload intact.
 - `task_cap` for `free` is written as 5 and marked a placeholder.
 - `askAboveSearches = 6` is the one approval research has; it is the cost
   gate, not a feature the brief asked for by name.

@@ -156,6 +156,18 @@ echo "$guarded" | grep -A10 "catch (error)" | grep -q 'recordStep(env, task, { n
     && [ "$(sed 's|//.*||' "$RUN" | grep -c 'taskStep')" = "0" ]
 check "the failed ledger entry is written inside guardedStep's catch before the rethrow; runTask reads nothing off the engine's error" $?
 
+# FAILING EDIT: take askedAt from Date.now() at the top of askUser instead of
+# the ask-write step's output (what the live run of 2026-10-11 did: after the
+# hibernated wait the engine replays run() and a local is the replay's time).
+ask=$(body "$RUN" askUser | sed 's|//.*||')
+echo "$ask" | grep -q 'const asked = await step.do("ask-write"' && echo "$ask" | grep -q 'return { askedAt, until };' \
+    && ! echo "$ask" | grep -q '^  const askedAt = Date.now()' && echo "$ask" | grep -q 'waitedMs: Date.now() - asked.askedAt'
+check "the wait's start is the ask-write step's output, so a replay after hibernation keeps it" $?
+
+# FAILING EDIT: classify the reason with message.startsWith("max_duration").
+grep -q 'max_duration\\b/.test(message)' "$RUN" && ! grep -q 'startsWith("max_duration")' "$RUN"
+check "max_duration is found as a word in the message the engine prefixes with the error's name" $?
+
 # FAILING EDIT: import NonRetryableError from "cloudflare:workflows" in run.js.
 elsewhere=$(cat $PURE "$SRC" | sed 's|//.*||' | grep -c '"cloudflare:')
 in_wf=$(sed 's|//.*||' "$WF" | grep -c '"cloudflare:')
