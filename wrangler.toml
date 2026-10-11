@@ -25,15 +25,17 @@ database_id = "0206e486-ed56-472d-ac58-d24c998f9cf2"
 
 # Long-running tasks (SPEC.md A82). One Workflow for every task type; the
 # type is a param. The instance keeps completed and errored state for the
-# same seven days the D1 row does, and /v1/tasks/take deletes it once the
-# result has been collected, so there is one retention and not two.
+# same three days the D1 row does, and /v1/tasks/take deletes it once the
+# result has been collected, so there is one retention and not two. Three
+# is the Workers Free cap: the API answers 7 days with 400
+# workflows.api.error.body (measured 2026-10-11).
 [[workflows]]
 name = "otto-tasks"
 binding = "TASKS"
 class_name = "OttoTask"
   [workflows.default_retention]
-  success_retention = "7 days"
-  error_retention = "7 days"
+  success_retention = "3 days"
+  error_retention = "3 days"
 
 [observability]
 enabled = false

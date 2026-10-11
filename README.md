@@ -236,9 +236,10 @@ The row in D1 is the truth and the Workflow instance with the same id is the
 engine. A task is bounded by its type's `maxDurationMs` — the platform has no
 cap of its own — and the comparison runs inside every step; time spent
 waiting for an approval is recorded on the row and forgiven. Retention is a
-comparison at read: a finished row seven days old is deleted when the
-account's rows are next read, and the instance keeps the same seven days and
-is deleted when the result is taken. Refusals: `needs_account` for a trial
+comparison at read: a finished row three days old is deleted when the
+account's rows are next read, and the instance keeps the same three days and
+is deleted when the result is taken. Three days is the Workers Free cap on
+instance retention, and the one number is set to it. Refusals: `needs_account` for a trial
 device, `unknown_type`, `document_not_allowed`, `task_limit` past the plan's
 `task_cap` (zero means no gate; `free` is 5 a day as a placeholder),
 `not_awaiting`, `already_finished`, `not_finished`, `task_not_started`.

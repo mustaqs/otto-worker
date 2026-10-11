@@ -26,8 +26,8 @@ import { summaryFromRows, tasksHeader, TERMINAL } from "./summary.js";
 
 export { TASK_VERSION };
 
-/** The row's retention after a terminal state. The instance's "7 days" in wrangler.toml and on create() is the same seven; the test asserts it. */
-export const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+/** The row's retention after a terminal state. The instance's "3 days" in wrangler.toml and on create() is the same three (the Workers Free cap); the test asserts it. */
+export const RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
 
 // ------------------------------------------------------------------- run
 

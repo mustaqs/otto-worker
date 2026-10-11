@@ -13,7 +13,7 @@ the step; (3) `askUser` maps only the `waitForEvent` timeout to `expired`;
 any other error is `step_failed`. Placeholders accepted: `task_cap` free = 5,
 `askAboveSearches` = 6.
 
-Decisions already taken (2026-10-10): Cloudflare Workflows; retention 7 days
+Decisions already taken (2026-10-10): Cloudflare Workflows; retention 7 days, revised to 3 days on 2026-10-11 (the Workers Free cap on instance retention, see section 10)
 after a terminal state, the Workflow instance's own retention matched and the
 instance deleted once the result is taken; research 30 minutes / 20 steps;
 approval timeout 24 hours; catalog static in the app; `otto-tasks` exact on
@@ -80,7 +80,8 @@ transition is named below with who makes it. Retention is a comparison at
 read, in the shape `integrationRows` already uses: a terminal row past
 `expires_at` is deleted when the account's rows are next read, no cron. The
 Workflow's own copy of the run — Cloudflare keeps completed instance state
-seven days by default on Paid since 2026-09-10 — is set to the same seven and
+seven days by default on Paid since 2026-09-10, and caps it at three on Free —
+is set to the same three and
 the instance is deleted when the result is taken, so there is one retention,
 not two.
 
@@ -123,13 +124,13 @@ are one each, when you do them. It makes two more when you sign in …" The
 privacy page gains: "If you ask Otto to work on something that takes a while,
 the work runs on our relay, not on your Mac, and the result waits there until
 you next ask Otto something or open its menu. We keep what you asked for, the
-steps it took and the result for seven days or until you delete them, and
+steps it took and the result for three days or until you delete them, and
 nothing else about it."
 
 **The A26 rows:** *A task* | what you asked for, the window line, the document
-only when the task needed it, each step's outcome and the result, kept seven
+only when the task needed it, each step's outcome and the result, kept three
 days after it finishes or until you delete it | **does not** retain longer, by
-the relay, and the Workflow's own copy is set to the same seven days and
+the relay, and the Workflow's own copy is set to the same three days and
 deleted when you collect the result. *Where it runs* | on our relay, as a
 Cloudflare Workflow, never on your Mac | **cannot** run on the Mac: no timer,
 no poll, no stream; `Bench/check-tasks.sh` (A83) fails if one appears.
@@ -167,7 +168,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL,
   finished_at INTEGER,                                 -- set on the first terminal state
-  expires_at  INTEGER                                  -- finished_at + 7 days; a comparison at read deletes the row
+  expires_at  INTEGER                                  -- finished_at + 3 days; a comparison at read deletes the row
 );
 CREATE INDEX IF NOT EXISTS tasks_by_account ON tasks(account_id, updated_at);
 
@@ -237,7 +238,7 @@ export const TYPES = {
     maxSteps: 20,                              // plan + ≤12 searches + ask + draft + finish ≤ 16; the test counts the longest path
     costClass: "model",                        // no vendor
     model: "claude-sonnet-5",
-    retention: "7 days",
+    retention: "3 days",
     run: runResearch,                          // (ctx) → { spoken, detail, deliver }
     render: renderResearch,                    // (draft, input) → { spoken ≤240, detail ≤256 KB, deliver: { notes: { title, body } } }
   },
@@ -373,8 +374,8 @@ name = "otto-tasks"
 binding = "TASKS"
 class_name = "OttoTask"
   [workflows.default_retention]
-  success_retention = "7 days"
-  error_retention = "7 days"
+  success_retention = "3 days"
+  error_retention = "3 days"
 ```
 
 `src/main.js`:
@@ -407,7 +408,7 @@ import { anthropic } from "./model.js";
 import { summaryFromRows } from "./summary.js";
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "expired"]);
-export const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;   // the row; the instance's "7 days" in wrangler.toml and on create() is the same number, asserted by the test
+export const RETENTION_MS = 3 * 24 * 60 * 60 * 1000;   // the row; the instance's "3 days" in wrangler.toml and on create() is the same number, asserted by the test
 
 export async function runTask({ event, step, env, NonRetryableError }) {
   const params = event.payload;                           // { type, accountId, input, taskVersion }
@@ -570,7 +571,7 @@ verified red by the edit named beside it. Files: `SRC=src/index.js`,
 | 12 | `createTask` refuses `document` unless `needsDocument`, and `TYPES.research.needsDocument === false` | set it true |
 | 13 | `createTask` refuses any body key outside `type request context document now tz` (an allowlist, A60's rule) | add `image` to the allowlist |
 | 14 | no `console.` line in the task routes or under `src/tasks/` interpolates `request\|input\|document\|result\|detail\|question\|spoken\|payload\|steps\|answer\|findings\|body\|text\|messages` | log `${result.spoken}` in `finishTask` |
-| 15 | `RETENTION_MS` is `7 * 24 * 60 * 60 * 1000`, `wrangler.toml` carries `success_retention = "7 days"` and `error_retention = "7 days"`, and `TYPES.research.retention === "7 days"` | change one of the three |
+| 15 | `RETENTION_MS` is `3 * 24 * 60 * 60 * 1000`, `wrangler.toml` carries `success_retention = "3 days"` and `error_retention = "3 days"`, and `TYPES.research.retention === "3 days"` | change one of the three |
 | 16 | `TYPES.research.model === "claude-sonnet-5"`; its web search tool carries `allowed_callers: ["direct"]` and `max_uses` | drop `allowed_callers` |
 | 17 | `takeTask` calls `.delete()` on the instance after the `seen_at` write (line order) | delete first |
 | 18 | `README.md` says the body-reading claim is about the question path: grep `never reads a response body on the question path` | restore the old sentence |
@@ -597,7 +598,7 @@ it advances.
 - a trial device gets `needs_account`, nothing created, nothing read from D1
 - `type: "dinner"` is `unknown_type`; an empty request, a 4,001-char request, and a non-ISO `now` are `bad_request`
 - `document` on research is `document_not_allowed`; an `image` key is `bad_request` before any write
-- a good create: row `created→running` is not asserted here (the Workflow does that) — row `created`, `created_at = now`, `input` holds exactly `{request, context, now, tz, taskVersion: 1}`; `TASKS.create` was called with `id === row.id`, `params = { type, accountId, input, taskVersion }`, `retention = { successRetention: "7 days", errorRetention: "7 days" }`
+- a good create: row `created→running` is not asserted here (the Workflow does that) — row `created`, `created_at = now`, `input` holds exactly `{request, context, now, tz, taskVersion: 1}`; `TASKS.create` was called with `id === row.id`, `params = { type, accountId, input, taskVersion }`, `retention = { successRetention: "3 days", errorRetention: "3 days" }`
 - the day counter `u:<acct>:k:<day>` is written before `create`; with `task_cap: 1` the second create is `429 task_limit` and `TASKS.create` was called once
 - the reply header is `v=1;running=0;awaiting=0;unseen=0;t=<id>:created:research` (the Workflow has not run)
 
@@ -666,7 +667,7 @@ present and never `input` or `detail`; another account's rows are absent.
 
 **Retention.** A `succeeded` row with `expires_at` in the past is deleted when
 `/v1/tasks` is next called, its instance `delete()` called, and it is absent
-from the reply and the summary; a non-terminal row older than seven days is
+from the reply and the summary; a non-terminal row older than three days is
 untouched.
 
 **The question path.** With a summary in KV, `/v1/ask`'s reply carries
@@ -689,6 +690,15 @@ test file.
 
 ## 10. What this checkpoint does not decide
 
+- **Retention, revised 2026-10-11.** The first deploy's trigger step failed
+  with `400 workflows.api.error.body` on `default_retention "7 days"`; the
+  same PUT with `"3 days"` succeeds, and the Workflow's versions report
+  `limits.steps 1024` and a 259,200,000 ms default retention — the Workers
+  Free values. The decision is to stay on Free, so the one retention number
+  is three days in all four places (`wrangler.toml` twice,
+  `TYPES.research.retention`, `RETENTION_MS`) and A82's sentence says three.
+  The other Free limits a step must live inside: 10 ms CPU per step, 1,024
+  steps per instance, 3,000 steps a day across the account.
 - `task_cap` for `free` is written as 5 and marked a placeholder.
 - `askAboveSearches = 6` is the one approval research has; it is the cost
   gate, not a feature the brief asked for by name.

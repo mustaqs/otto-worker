@@ -1193,7 +1193,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     check("the instance was created with the row's id, the params and the row's retention",
           created && created.id === j1.id && created.params.type === "research" && created.params.accountId === accountId
           && created.params.input.request === goodBody.request && created.params.taskVersion === TASK_VERSION
-          && created.retention.successRetention === "7 days" && created.retention.errorRetention === "7 days");
+          && created.retention.successRetention === "3 days" && created.retention.errorRetention === "3 days");
     check("the day counter was written before the create", [...kv.store.keys()].some((k) => k.startsWith(`u:${accountId}:k:`)) && kv.store.get([...kv.store.keys()].find((k) => k.startsWith(`u:${accountId}:k:`))) === "1");
     check("the reply's header lists the new task as created", header(r1) === `v=1;running=1;awaiting=0;unseen=0;t=${j1.id}:created:research`, header(r1));
 
@@ -1241,7 +1241,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
           JSON.stringify(names) === JSON.stringify(["start", "plan", "search-1", "search-2", "search-3", "draft", "finish"]), JSON.stringify(names));
     check("every step carried a timeout and retries", step.calls.every((c) => c.config && c.config.timeout && c.config.retries));
     const result = JSON.parse(row.result);
-    check("the row ended succeeded with a spoken sentence, a note to deliver, finished_at and a seven-day expires_at",
+    check("the row ended succeeded with a spoken sentence, a note to deliver, finished_at and a three-day expires_at",
           row.state === "succeeded" && result.spoken.length > 0 && result.spoken.length <= 240 && result.deliver.notes.title === "Swift actor reentrancy"
           && result.detail.startsWith("# Answer") && row.finished_at === clock && row.expires_at === row.finished_at + RETENTION_MS);
     const steps = JSON.parse(row.steps);

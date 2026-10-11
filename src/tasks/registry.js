@@ -42,7 +42,7 @@ export const TYPES = {
     maxSteps: 20,
     costClass: "model",
     model: "claude-sonnet-5",
-    retention: "7 days",
+    retention: "3 days",
     run: runResearch,
     render: renderResearch,
   },

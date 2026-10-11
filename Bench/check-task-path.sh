@@ -234,10 +234,10 @@ check "no log line in the task routes or src/tasks/ interpolates a request, a re
 echo "tasks — one retention, one model:"
 
 # FAILING EDIT: change any one of the four sevens.
-grep -q "RETENTION_MS = 7 \* 24 \* 60 \* 60 \* 1000" "$RUN" \
-    && [ "$(grep -c '_retention = "7 days"' "$TOML")" = "2" ] \
-    && grep -A14 "research: {" "$REG" | grep -q 'retention: "7 days"'
-check "the row, the binding's default_retention (both) and research's retention are all seven days" $?
+grep -q "RETENTION_MS = 3 \* 24 \* 60 \* 60 \* 1000" "$RUN" \
+    && [ "$(grep -c '_retention = "3 days"' "$TOML")" = "2" ] \
+    && grep -A14 "research: {" "$REG" | grep -q 'retention: "3 days"'
+check "the row, the binding's default_retention (both) and research's retention are all three days" $?
 
 # FAILING EDIT: drop allowed_callers from WEB_SEARCH, or change the model.
 grep -A14 "research: {" "$REG" | grep -q 'model: "claude-sonnet-5"' \
