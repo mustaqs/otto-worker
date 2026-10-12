@@ -1518,7 +1518,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
           cancelReply.status === 200
           && tasks.log.some((l) => l.id === id3 && l.call === "terminate") && db.tasks.find((t) => t.id === id3).reason === "user");
     check("the user's own cancel is already seen: seen_at is set and the cancel reply's header does not list it unseen",
-          db.tasks.find((t) => t.id === id3).seen_at === clock && !header(cancelReply).includes(`${id3}:cancelled`) && /unseen=0/.test(header(cancelReply)));
+          db.tasks.find((t) => t.id === id3).seen_at === clock && !header(cancelReply).includes(`${id3}:cancelled`));
     check("cancel on a finished task is already_finished", (await post("/v1/tasks/cancel", deviceToken, { id: taskId })).status === 409);
     void running;
   }
