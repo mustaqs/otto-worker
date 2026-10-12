@@ -38,6 +38,7 @@ export const TYPES = {
     needsDocument: false,
     approvalTimeout: "24 hours",
     askAboveSearches: 6,
+    centsPerSearch: 9,       // the question's all-in estimate per planned search: 89.2 cents for ten on the first live run (2026-10-11), before the step was bounded
     maxDurationMs: 30 * 60 * 1000,
     maxSteps: 20,
     costClass: "model",

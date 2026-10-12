@@ -254,8 +254,16 @@ check "the row, the binding's default_retention (both) and research's retention 
 # FAILING EDIT: drop allowed_callers from WEB_SEARCH, or change the model.
 grep -A14 "research: {" "$REG" | grep -q 'model: "claude-sonnet-5"' \
     && grep -A6 "WEB_SEARCH = {" "$RESEARCH" | grep -q 'allowed_callers: \["direct"\]' \
-    && grep -A6 "WEB_SEARCH = {" "$RESEARCH" | grep -q "max_uses:"
+    && grep -A6 "WEB_SEARCH = {" "$RESEARCH" | grep -q "max_uses: 2,"
 check "research runs on claude-sonnet-5 with direct, bounded web search" $?
+
+# FAILING EDIT: raise FINDINGS_MAX_CHARS, the search step's maxTokens, or
+# put a number in the question instead of the registry's centsPerSearch.
+grep -q "^const FINDINGS_MAX_CHARS = 4096;" "$RESEARCH" \
+    && grep -A3 "tools: \[WEB_SEARCH\]," "$RESEARCH" | grep -q "maxTokens: 1024," \
+    && grep -q 'roughly ${plan.queries.length \* ctx.entry.centsPerSearch} cents' "$RESEARCH" \
+    && grep -A14 "research: {" "$REG" | grep -q "centsPerSearch: 9,"
+check "a search step is bounded (1,024 output tokens, 4,096 characters to the draft) and the question's estimate is the registry's centsPerSearch" $?
 
 # FAILING EDIT: compose an "otto-tasks" string in index.js.
 composed=$(strip "$SRC" "$RUN" "$RESEARCH" "$REG" "$MODEL" | grep -c '"otto-tasks"')

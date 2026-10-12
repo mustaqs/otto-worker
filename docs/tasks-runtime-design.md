@@ -263,7 +263,7 @@ ctx = {
 | --- | --- | --- | --- |
 | `plan` | Sonnet 5, no tools: "write 2–12 search queries and a one-line outline" | `{ queries: string[], outline }` | 2 min / 2 |
 | `ask-scope` (only if `queries.length > askAboveSearches`) | none | `"approve"` / `"decline"` / `"timeout"` | the type's 24 h |
-| `search-1` … `search-N` (N = min(queries, 12)) | Sonnet 5 with `{ type: "web_search_20260209", name: "web_search", allowed_callers: ["direct"], max_uses: 3 }` | `{ findings ≤ 64 KB, citations[], searches }` | 4 min / 2 |
+| `search-1` … `search-N` (N = min(queries, 12)) | Sonnet 5 with `{ type: "web_search_20260209", name: "web_search", allowed_callers: ["direct"], max_uses: 2 }` | `{ findings ≤ 64 KB, citations[], searches }` | 4 min / 2 |
 | `draft` | Sonnet 5, no tools, all findings | `{ title, spoken, body }` | 4 min / 2 |
 | `finish` | none | writes `result` via `render`, state `succeeded` | final step |
 
@@ -610,7 +610,7 @@ final steps' shape; the row ends `succeeded` with `result.spoken` ≤ 240,
 `result.deliver.notes.title`, `finished_at` set, `expires_at = finished_at + 7 d`;
 `steps` has one entry per step with `cents` summing to the scripted usage at
 the price table; the Anthropic calls' `tools` on the search steps were
-`[{ type: "web_search_20260209", name: "web_search", allowed_callers: ["direct"], max_uses: 3 }]`
+`[{ type: "web_search_20260209", name: "web_search", allowed_callers: ["direct"], max_uses: 2 }]`
 and the plan and draft calls had no `tools`; the model was `claude-sonnet-5`;
 the KV summary now has one `unseen` with `s`; the console carried no word from
 the request, the findings or the draft (the script plants `SECRETWORD`).
@@ -710,6 +710,17 @@ test file.
   from its cached output, so nothing computed outside a step survives — the
   wait's start is the ask-write step's output; (3) `waitForEvent` across a
   34-minute wait resolved with the payload intact.
+- **Cost per search, measured 2026-10-11.** The first full run (27ad6d37,
+  ten searches) cost 89.2 cents: each search step ran two searches, read
+  about 20,000 input tokens of results (the API counts the results of every
+  search iteration as input), wrote about 2,150 tokens of findings, and cost
+  8 to 9 cents; the draft read 21,774 tokens. The question had estimated 3
+  cents a search. Decisions: the estimate is the registry's `centsPerSearch`
+  (9, all-in), `max_uses` is 2, the search step is bounded to 1,024 output
+  tokens and 4,096 characters of findings to the draft, and its prompt asks
+  for one search unless the first does not answer. The result tokens the
+  API feeds back inside a direct search have no parameter of their own; the
+  levers are the number of searches and the size of what a step writes.
 - `task_cap` for `free` is written as 5 and marked a placeholder.
 - `askAboveSearches = 6` is the one approval research has; it is the cost
   gate, not a feature the brief asked for by name.

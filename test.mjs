@@ -1241,7 +1241,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     script = [
       text(JSON.stringify({ queries: ["swift actor reentrancy", "actor hop suspension", "reentrancy pitfalls"], outline: "the rule, then the pitfall" }), usages[0]),
       { ...searchReply(`Actors are reentrant at every await ${SECRET}`, 3, ["https://swift.org/a"]), usage: usages[1] },
-      { ...searchReply("A hop is a suspension point", 2, ["https://swift.org/b"]), usage: usages[2] },
+      { ...searchReply("A hop is a suspension point " + "L".repeat(5000), 2, ["https://swift.org/b"]), usage: usages[2] },
       { ...searchReply("Pitfalls: stale state after await", 1), usage: usages[3] },
       text("```json\n" + JSON.stringify({ title: "Swift actor reentrancy", spoken: "Actors are reentrant at every await, so state read before an await can be stale after it.", body: `# Answer\nReentrant. ${SECRET}\n\n## Sources\n- https://swift.org/a` }) + "\n```", usages[4]),
     ];
@@ -1264,8 +1264,12 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
           && Math.abs(ledgerCents - happyCents) < 0.001 && steps[2].searches === 3 && steps[2].model === "claude-sonnet-5", `${ledgerCents} vs ${happyCents}`);
     check("the search steps carried exactly the direct, bounded web search tool and the plan and draft carried none",
           modelCalls.length === 5
-          && [1, 2, 3].every((i) => JSON.stringify(modelCalls[i].body.tools) === JSON.stringify([{ type: "web_search_20260209", name: "web_search", allowed_callers: ["direct"], max_uses: 3 }]))
+          && [1, 2, 3].every((i) => JSON.stringify(modelCalls[i].body.tools) === JSON.stringify([{ type: "web_search_20260209", name: "web_search", allowed_callers: ["direct"], max_uses: 2 }]))
           && modelCalls[0].body.tools === undefined && modelCalls[4].body.tools === undefined);
+    check("the search step is bounded to 1,024 output tokens and the plan to 1,024, the draft to 4,096",
+          modelCalls[1].body.max_tokens === 1024 && modelCalls[0].body.max_tokens === 1024 && modelCalls[4].body.max_tokens === 4096);
+    check("findings longer than 4,096 characters are cut before the draft reads them",
+          modelCalls[4].body.messages[0].content.includes("A hop is a suspension point " + "L".repeat(4096 - 28)) && !modelCalls[4].body.messages[0].content.includes("L".repeat(4096 - 27)));
     check("every call was on claude-sonnet-5 with the key as x-api-key", modelCalls.every((c) => c.body.model === "claude-sonnet-5" && c.headers["x-api-key"] === envTasks.ANTHROPIC_API_KEY));
     const summary = JSON.parse(kv.store.get(`tasks:${accountId}`));
     check("the KV summary now has one unseen result with its sentence", summary.unseen.length === 1 && summary.unseen[0].id === taskId && summary.unseen[0].s === result.spoken && summary.running.length === 0);
@@ -1386,7 +1390,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     const row = db.tasks.find((t) => t.id === id);
     const question = JSON.parse(rowWhileWaiting.question);
     check("more searches than askAboveSearches put the row in awaiting_approval with a question and the full 24-hour window",
-          rowWhileWaiting.state === "awaiting_approval" && question.spoken.includes("8 searches") && question.until - question.askedAt === 24 * HOUR);
+          rowWhileWaiting.state === "awaiting_approval" && question.spoken.includes("8 searches") && question.spoken.includes("roughly 72 cents") && question.until - question.askedAt === 24 * HOUR);
     check("the summary carried the question while waiting", summaryWhileWaiting.awaiting.length === 1 && summaryWhileWaiting.awaiting[0].q === question.spoken);
     const wait = step.calls.find((c) => c.wait);
     check("the wait was for the approval type with the full 24-hour timeout", wait.config.type === "approval" && wait.config.timeout === `${24 * HOUR} ms`);

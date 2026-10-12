@@ -11,7 +11,13 @@
 import { costOf, SPOKEN_MAX_CHARS, DETAIL_MAX_BYTES } from "./registry.js";
 
 export const MAX_SEARCHES = 12;
-const FINDINGS_MAX_CHARS = 65536;
+/**
+ * What one search step may hand the draft. Measured on the first live run
+ * (27ad6d37, 2026-10-11): each step's findings ran to about 2,150 output
+ * tokens, about 8,500 characters, and the draft read 21,774 input tokens for
+ * ten of them. The step's maxTokens (1,024) and this cap halve both.
+ */
+const FINDINGS_MAX_CHARS = 4096;
 
 /**
  * Direct web search on the task's model. `allowed_callers: ["direct"]` keeps
@@ -24,7 +30,7 @@ export const WEB_SEARCH = {
   type: "web_search_20260209",
   name: "web_search",
   allowed_callers: ["direct"],
-  max_uses: 3,
+  max_uses: 2,
 };
 
 const PLAN_SYSTEM = `You plan a short piece of research for a voice assistant's user. \
@@ -32,8 +38,9 @@ Reply with JSON only: {"queries": ["…"], "outline": "one line"}. Between two a
 web search queries, each specific enough to return useful pages. No prose outside the JSON.`;
 
 const SEARCH_SYSTEM = `You research one question for a voice assistant's user using web search. \
-Search, read the results, and report what you found in plain prose with the facts, figures, \
-dates and the source for each. Say when sources disagree. No preamble.`;
+Search once; search a second time only if the first results do not answer. Report what you found \
+in plain prose, under 250 words, with the facts, figures, dates and the source for each. Say when \
+sources disagree. No preamble.`;
 
 const DRAFT_SYSTEM = `You write up research for a voice assistant's user, from findings gathered \
 by earlier searches. Reply with JSON only: {"title": "a short note title", "spoken": "one sentence \
@@ -61,7 +68,7 @@ export async function runResearch(ctx) {
   }, { timeout: "2 minutes" });
 
   if (plan.queries.length > ctx.entry.askAboveSearches) {
-    await ctx.ask(`This needs about ${plan.queries.length} searches, roughly ${plan.queries.length * 3} cents. Go ahead?`);
+    await ctx.ask(`This needs about ${plan.queries.length} searches, roughly ${plan.queries.length * ctx.entry.centsPerSearch} cents. Go ahead?`);
   }
 
   const findings = [];
@@ -72,7 +79,7 @@ export async function runResearch(ctx) {
         system: SEARCH_SYSTEM,
         messages: [{ role: "user", content: `The user's question: ${question}\n\nSearch for: ${query}` }],
         tools: [WEB_SEARCH],
-        maxTokens: 2048,
+        maxTokens: 1024,
       });
       return {
         query,
