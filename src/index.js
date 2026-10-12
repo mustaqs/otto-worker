@@ -1448,7 +1448,8 @@ async function approveTask(request, env) {
   if (row.state !== "awaiting_approval") return problem(409, "not_awaiting", { state: row.state }, await safeTasksHeader(env, task.accountId));
 
   const state = decision === "approve" ? "approved" : "declined";
-  await markState(env, task, state, { answer: { decision, at: Date.now() } });
+  // A decline ends the task by the user's own word, so it is seen as well.
+  await markState(env, task, state, { answer: { decision, at: Date.now() }, seen: decision === "decline" });
   try {
     const instance = await env.TASKS.get(task.id);
     await instance.sendEvent({ type: "approval", payload: { decision } });
@@ -1472,7 +1473,9 @@ async function cancelTask(request, env) {
   const { task, row } = found;
   if (TERMINAL.has(row.state)) return problem(409, "already_finished", { state: row.state }, await safeTasksHeader(env, task.accountId));
   await terminateInstance(env, task.id);
-  await finishTask(env, task, "cancelled", { reason: "user" });
+  // SEEN BY THE USER WHO CANCELLED IT (A82, from the app's design): the row
+  // would otherwise ride the next header as unseen and be announced back.
+  await finishTask(env, task, "cancelled", { reason: "user", seen: true });
   console.log(`task ${row.type} cancelled`);
   return json200({ id: task.id, state: "cancelled" }, await safeTasksHeader(env, task.accountId));
 }

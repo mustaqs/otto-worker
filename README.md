@@ -238,7 +238,8 @@ cap of its own — and the comparison runs inside every step; time spent
 waiting for an approval is recorded on the row and forgiven. Retention is a
 comparison at read: a finished row three days old is deleted when the
 account's rows are next read, and the instance keeps the same three days and
-is deleted when the result is taken. Three days is the Workers Free cap on
+is deleted when the result is taken. A row the user cancels or declines is
+marked seen at once, so it is never announced back to them. Three days is the Workers Free cap on
 instance retention, and the one number is set to it. Refusals: `needs_account` for a trial
 device, `unknown_type`, `document_not_allowed`, `task_limit` past the plan's
 `task_cap` (zero means no gate; `free` is 5 a day as a placeholder),

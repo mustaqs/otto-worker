@@ -992,7 +992,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
 {
   const { runTask, RETENTION_MS, durationMs, isTimeout } = await import("./src/tasks/run.js");
   const { TYPES, centsOf, TASK_VERSION } = await import("./src/tasks/registry.js");
-  const { summaryFromRows, tasksHeader } = await import("./src/tasks/summary.js");
+  const { summaryFromRows, tasksHeader, endedSentence } = await import("./src/tasks/summary.js");
 
   class NonRetryableError extends Error { constructor(m) { super(m); this.name = "NonRetryableError"; } }
 
@@ -1466,7 +1466,9 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     await runWorkflow(id, step);
     const row = db.tasks.find((t) => t.id === id);
     check("declined ends cancelled with reason declined and no search was made", row.state === "cancelled" && row.reason === "declined" && modelCalls.length === 1);
-    check("the summary says why", JSON.parse(kv.store.get(`tasks:${accountId}`)).unseen.some((u) => u.id === id && u.s === "The research stopped because you said no."));
+    check("the user's own decline is already seen: the row carries seen_at and the summary does not list it unseen",
+          row.seen_at != null && !JSON.parse(kv.store.get(`tasks:${accountId}`)).unseen.some((u) => u.id === id));
+    check("and the fixed sentence still exists for a decline that reaches a summary unseen", endedSentence("research", "cancelled", "declined") === "The research stopped because you said no.");
   }
 
   // --- approval: the wait times out, and (correction 3) another error does not read as a timeout
@@ -1511,9 +1513,12 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     const r3 = await post("/v1/tasks/create", deviceToken, goodBody);
     const id3 = (await r3.json()).id;
     check("take on an unfinished task is not_finished", (await post("/v1/tasks/take", deviceToken, { id: id3 })).status === 409);
+    const cancelReply = await post("/v1/tasks/cancel", deviceToken, { id: id3 });
     check("cancel on a running task terminates the instance and says the user did it",
-          (await post("/v1/tasks/cancel", deviceToken, { id: id3 })).status === 200
+          cancelReply.status === 200
           && tasks.log.some((l) => l.id === id3 && l.call === "terminate") && db.tasks.find((t) => t.id === id3).reason === "user");
+    check("the user's own cancel is already seen: seen_at is set and the cancel reply's header does not list it unseen",
+          db.tasks.find((t) => t.id === id3).seen_at === clock && !header(cancelReply).includes(`${id3}:cancelled`) && /unseen=0/.test(header(cancelReply)));
     check("cancel on a finished task is already_finished", (await post("/v1/tasks/cancel", deviceToken, { id: taskId })).status === 409);
     void running;
   }

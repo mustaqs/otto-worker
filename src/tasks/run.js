@@ -221,10 +221,13 @@ export async function deleteRow(env, task) {
   await env.DB.prepare(`DELETE FROM tasks WHERE id = ? AND account_id = ?`).bind(task.id, task.accountId).run();
 }
 
-export async function markState(env, task, state, { question, answer, waitedMs } = {}) {
+export async function markState(env, task, state, { question, answer, waitedMs, seen } = {}) {
   const fields = { state };
   if (question) fields.question = JSON.stringify(question);
   if (answer) fields.answer = JSON.stringify(answer);
+  // A decline is the user's answer: the row it ends is seen before the
+  // Workflow finishes it, so finishTask's own UPDATE leaves seen_at alone.
+  if (seen) fields.seen_at = Date.now();
   if (waitedMs) {
     const row = await readRow(env, task);
     fields.waited_ms = (Number(row && row.waited_ms) || 0) + Math.max(0, Math.round(waitedMs));
@@ -251,11 +254,14 @@ export async function recordStep(env, task, entry) {
   }
 }
 
-export async function finishTask(env, task, state, { result, reason } = {}) {
+export async function finishTask(env, task, state, { result, reason, seen } = {}) {
   const now = Date.now();
   const fields = { state, finished_at: now, expires_at: now + RETENTION_MS };
   if (result) fields.result = JSON.stringify(result);
   if (reason) fields.reason = reason;
+  // THE USER'S OWN CANCEL IS ALREADY SEEN. A row the user ended knowingly
+  // must not come back on the next chord as "The research was cancelled."
+  if (seen) fields.seen_at = now;
   await updateRow(env, task, fields);
   await writeSummary(env, task.accountId);
 }

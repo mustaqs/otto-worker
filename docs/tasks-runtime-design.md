@@ -690,6 +690,11 @@ test file.
 
 ## 10. What this checkpoint does not decide
 
+- **Cancel and decline are seen, decided 2026-10-12 at the app's design
+  checkpoint (A83, P4).** `cancelTask` finishes the row with `seen_at` set
+  and a decline's `markState` sets it before the Workflow finishes the row,
+  so neither rides a later header as unseen; a test and a bench check pin
+  both. Branch `tasks-cancel-seen`.
 - **Retention, revised 2026-10-11.** The first deploy's trigger step failed
   with `400 workflows.api.error.body` on `default_retention "7 days"`; the
   same PUT with `"3 days"` succeeds, and the Workflow's versions report

@@ -222,6 +222,13 @@ grep -q 'CREATE_KEYS = \["type", "request", "context", "document", "now", "tz"\]
     && echo "$create" | grep -q "CREATE_KEYS.includes(key)"
 check "the create body is an allowlist of six keys, so an image has no name to arrive under" $?
 
+# FAILING EDIT: drop `seen: true` from cancelTask's finishTask, or the
+# `seen: decision === "decline"` from approveTask's markState. A row the user
+# ended knowingly must not ride the next header as unseen.
+body "$SRC" cancelTask | grep -q 'finishTask(env, task, "cancelled", { reason: "user", seen: true })' \
+    && body "$SRC" approveTask | grep -q 'seen: decision === "decline"'
+check "the user's own cancel and decline mark the row seen" $?
+
 # FAILING EDIT: move `deleteInstance` above `markSeen` in takeTask.
 take=$(body "$SRC" takeTask)
 seen_line=$(echo "$take" | grep -n "markSeen(" | head -1 | cut -d: -f1)
