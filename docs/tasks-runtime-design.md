@@ -721,6 +721,10 @@ test file.
   for one search unless the first does not answer. The result tokens the
   API feeds back inside a direct search have no parameter of their own; the
   levers are the number of searches and the size of what a step writes.
+  Measured again on the bounded step (f97f67a0, six searches, 2026-10-12):
+  every step ran one search, read about 13,000 input tokens, cost 4.2 to
+  4.8 cents, and the task cost 29.5 cents — 4.9 a search all-in against the
+  9 the question would have said, so `centsPerSearch` is 5.
 - `task_cap` for `free` is written as 5 and marked a placeholder.
 - `askAboveSearches = 6` is the one approval research has; it is the cost
   gate, not a feature the brief asked for by name.

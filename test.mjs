@@ -1390,7 +1390,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     const row = db.tasks.find((t) => t.id === id);
     const question = JSON.parse(rowWhileWaiting.question);
     check("more searches than askAboveSearches put the row in awaiting_approval with a question and the full 24-hour window",
-          rowWhileWaiting.state === "awaiting_approval" && question.spoken.includes("8 searches") && question.spoken.includes("roughly 72 cents") && question.until - question.askedAt === 24 * HOUR);
+          rowWhileWaiting.state === "awaiting_approval" && question.spoken.includes("8 searches") && question.spoken.includes("roughly 40 cents") && question.until - question.askedAt === 24 * HOUR);
     check("the summary carried the question while waiting", summaryWhileWaiting.awaiting.length === 1 && summaryWhileWaiting.awaiting[0].q === question.spoken);
     const wait = step.calls.find((c) => c.wait);
     check("the wait was for the approval type with the full 24-hour timeout", wait.config.type === "approval" && wait.config.timeout === `${24 * HOUR} ms`);

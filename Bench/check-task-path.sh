@@ -262,7 +262,7 @@ check "research runs on claude-sonnet-5 with direct, bounded web search" $?
 grep -q "^const FINDINGS_MAX_CHARS = 4096;" "$RESEARCH" \
     && grep -A3 "tools: \[WEB_SEARCH\]," "$RESEARCH" | grep -q "maxTokens: 1024," \
     && grep -q 'roughly ${plan.queries.length \* ctx.entry.centsPerSearch} cents' "$RESEARCH" \
-    && grep -A14 "research: {" "$REG" | grep -q "centsPerSearch: 9,"
+    && grep -A14 "research: {" "$REG" | grep -q "centsPerSearch: 5,"
 check "a search step is bounded (1,024 output tokens, 4,096 characters to the draft) and the question's estimate is the registry's centsPerSearch" $?
 
 # FAILING EDIT: compose an "otto-tasks" string in index.js.
