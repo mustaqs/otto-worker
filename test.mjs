@@ -1038,6 +1038,9 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
             if (q.startsWith("SELECT * FROM tasks WHERE account_id = ?")) {
               return { results: tasks.filter((t) => t.account_id === args[0]).sort((a, b) => b.updated_at - a.updated_at).map((t) => ({ ...t })) };
             }
+            if (q.startsWith("SELECT id, state, updated_at FROM tasks WHERE account_id = ?")) {
+              return { results: tasks.filter((t) => t.account_id === args[0]).map((t) => ({ id: t.id, state: t.state, updated_at: t.updated_at })) };
+            }
             return { results: [] };
           },
           run: async () => {
@@ -1078,6 +1081,26 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
       terminate: async () => { log.push({ id, call: "terminate" }); },
       delete: async () => { log.push({ id, call: "delete" }); if (instances.get(id).gone) throw Object.assign(new Error("gone"), { name: "WorkflowNotFound" }); instances.get(id).gone = true; },
       status: async () => ({ status: "running" }),
+      // The feed's subscription (A84): `events` are scripted per instance;
+      // when they run out the next() holds, as a live instance's would, until
+      // the subscription is disposed or `end` is set, which makes it done.
+      subscribe: async (options) => {
+        const state = instances.get(id);
+        log.push({ id, call: "subscribe", options });
+        let wake = null;
+        const subscription = {
+          next: async () => {
+            for (;;) {
+              if (state.disposed) return { done: true, value: undefined };
+              if (state.events && state.events.length) return { done: false, value: state.events.shift() };
+              if (state.end) return { done: true, value: undefined };
+              await new Promise((resolve) => { wake = resolve; state.wake = resolve; });
+            }
+          },
+          [Symbol.dispose]: () => { state.disposed = true; log.push({ id, call: "dispose" }); if (wake) wake(); },
+        };
+        return subscription;
+      },
     });
     binding.create = async (options) => {
       if (binding.failCreate) throw Object.assign(new Error("refused"), { name: "WorkflowError" });
@@ -1585,6 +1608,185 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     check("with no summary in KV the header is absent, not zero", bare.headers.get("otto-tasks") === null);
     const trial = await worker.fetch(ask(valid, trialToken), envTasks, makeCtx());
     check("a trial's question reads no summary", !reads.some((k) => k === `tasks:${trialToken}`) && trial.status === 200);
+  }
+
+  // --- the feed (A84): a snapshot, then the platform's events, projected
+  {
+    const decoder = new TextDecoder();
+    // One SSE frame at a time from a response body: { event, data } or { comment }.
+    const frameReader = (response) => {
+      const reader = response.body.getReader();
+      let buffer = "";
+      return {
+        reader,
+        next: async (timeoutMs = 2000) => {
+          for (;;) {
+            const cut = buffer.indexOf("\n\n");
+            if (cut >= 0) {
+              const raw = buffer.slice(0, cut); buffer = buffer.slice(cut + 2);
+              if (raw.startsWith(":")) return { comment: raw.slice(1).trim() };
+              const lines = raw.split("\n");
+              const event = (lines.find((l) => l.startsWith("event: ")) || "").slice(7);
+              const data = (lines.find((l) => l.startsWith("data: ")) || "").slice(6);
+              return { event, data: data ? JSON.parse(data) : null, raw };
+            }
+            const chunk = await Promise.race([
+              reader.read(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("no frame within the timeout")), timeoutMs)),
+            ]);
+            if (chunk.done) return null;
+            buffer += decoder.decode(chunk.value, { stream: true });
+          }
+        },
+      };
+    };
+    const feed = (token, body, init = {}) => worker.fetch(new Request("https://w/v1/tasks/feed", {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }), ...init }), envTasks, makeCtx());
+
+    // Two rows written straight into the stand-in: one finished with a ledger
+    // and a result, one running with a plan in its ledger.
+    const t0 = 1_760_100_000_000;
+    const doneId = "feed-done-1", liveId = "feed-live-1";
+    db.tasks.length = 0;
+    db.tasks.push({
+      id: doneId, account_id: accountId, type: "research", state: "succeeded",
+      // The secret sits past the 120th character: the cut is what keeps it out.
+      input: JSON.stringify({ request: "Best standing desks " + "x".repeat(200) + ` ${SECRET}`, now: "2026-10-13T09:00:00Z", tz: "UTC", taskVersion: 1 }),
+      steps: JSON.stringify([
+        { name: "start", started: t0, ended: t0 + 5, outcome: "ok" },
+        { name: "plan", started: t0 + 10, ended: t0 + 900, outcome: "ok", label: "Planned 2 searches", queries: ["wirecutter standing desk", "reddit desk wobble"] },
+        { name: "search-1", started: t0 + 1000, ended: t0 + 9000, outcome: "ok", label: "wirecutter standing desk", searches: 2 },
+        { name: "search-2", started: t0 + 9000, ended: t0 + 18000, outcome: "failed", error: "model_http_529" },
+        { name: "draft", started: t0 + 18000, ended: t0 + 30000, outcome: "ok", label: "Writing it up" },
+        { name: "finish", started: t0 + 30000, ended: t0 + 30010, outcome: "ok" },
+      ]),
+      question: null, answer: null,
+      result: JSON.stringify({ spoken: "Flexispot wins.", detail: `# Findings ${SECRET}`, deliver: { notes: { title: "Standing desks", body: `## ${SECRET} body` } } }),
+      reason: null, waited_ms: 0, seen_at: null, created_at: t0, updated_at: t0 + 30010, finished_at: t0 + 30010, expires_at: t0 + 3 * 86_400_000,
+    });
+    db.tasks.push({
+      id: liveId, account_id: accountId, type: "research", state: "running",
+      input: JSON.stringify({ request: "Lisbon coworking day passes", now: "2026-10-13T09:00:00Z", tz: "UTC", taskVersion: 1 }),
+      steps: JSON.stringify([
+        { name: "start", started: t0, ended: t0 + 5, outcome: "ok" },
+        { name: "plan", started: t0 + 10, ended: t0 + 900, outcome: "ok", queries: ["lisbon coworking day pass", "second life coworking lisbon"] },
+        { name: "search-1", started: t0 + 1000, ended: t0 + 9000, outcome: "ok" },
+      ]),
+      question: null, answer: null, result: null, reason: null, waited_ms: 0, seen_at: null,
+      created_at: t0, updated_at: t0 + 9000, finished_at: null, expires_at: null,
+    });
+    tasks.instances.set(liveId, { events: [
+      { type: "workflow_running", instanceId: liveId, eventId: 1, timestamp: t0 },
+      { type: "step_started", instanceId: liveId, eventId: 9, timestamp: t0 + 9100, stepName: "search-2" },
+      { type: "attempt_started", instanceId: liveId, eventId: 10, timestamp: t0 + 9100, stepName: "search-2", attempt: 1 },
+      { type: "step_completed", instanceId: liveId, eventId: 12, timestamp: t0 + 15000, stepName: "search-2", output: { findings: `never forwarded ${SECRET}` } },
+      { type: "step_started", instanceId: liveId, eventId: 13, timestamp: t0 + 15001, stepName: "ask-write" },
+      { type: "wait_started", instanceId: liveId, eventId: 15, timestamp: t0 + 15100, stepName: "ask-wait", eventType: "approval" },
+    ] });
+    const realNowFeed = Date.now;
+    Date.now = () => t0 + 40000;
+
+    check("the feed needs an account behind the bearer", (await feed(trialToken, {})).status === 403);
+    const malformed = await worker.fetch(new Request("https://w/v1/tasks/feed", { method: "POST", headers: { authorization: `Bearer ${deviceToken}` }, body: "{not json" }), envTasks, makeCtx());
+    check("a malformed body is refused, an absent one is fine", malformed.status === 400 && (await malformed.json()).error === "malformed_json");
+
+    const response = await feed(deviceToken, undefined);
+    check("the feed is a 200 event stream with the otto-tasks header",
+          response.status === 200 && response.headers.get("content-type").startsWith("text/event-stream")
+          && header(response).startsWith("v=1;running=1;awaiting=0;unseen=1"), header(response));
+    const frames = frameReader(response);
+    const snapshot = await frames.next();
+    const done = snapshot && snapshot.data && snapshot.data.tasks.find((t) => t.id === doneId);
+    const live = snapshot && snapshot.data && snapshot.data.tasks.find((t) => t.id === liveId);
+    check("the first frame is the snapshot of both rows, newest first",
+          snapshot && snapshot.event === "snapshot" && snapshot.data.at === t0 + 40000 && snapshot.data.tasks.length === 2 && snapshot.data.tasks[0].id === doneId);
+    check("a projection carries subject (cut at 120), state, times, seen, spoken and the note's title",
+          done && done.subject.length === 120 && done.subject.startsWith("Best standing desks") && done.state === "succeeded"
+          && done.createdAt === t0 && done.finishedAt === t0 + 30010 && done.seen === false && done.spoken === "Flexispot wins." && done.noteTitle === "Standing desks" && done.type === "research");
+    check("its steps are plan, the searches and the draft, labelled; the bookkeeping steps are not shown",
+          done && done.steps.map((s) => s.name).join(",") === "plan,search-1,search-2,draft"
+          && done.steps[0].label === "Planned 2 searches" && done.steps[1].label === "wirecutter standing desk"
+          && done.steps[2].label === "reddit desk wobble" && done.steps[2].outcome === "failed" && done.steps[3].label === "Writing it up"
+          && done.steps[1].started === t0 + 1000 && done.steps[1].ended === t0 + 9000, JSON.stringify(done && done.steps));
+    check("a ledger without labels is labelled from the name and the plan's queries",
+          live && live.steps.map((s) => s.label).join("|") === "Planned 2 searches|lisbon coworking day pass", JSON.stringify(live && live.steps));
+    check("nothing of the detail, the note's body or the findings is in the snapshot", !snapshot.raw.includes(SECRET) && !snapshot.raw.includes("detail") && !snapshot.raw.includes("body"));
+
+    const running = await frames.next();
+    check("a live step_started becomes a running step frame, labelled from the plan's queries",
+          running && running.event === "step" && running.data.task === liveId && running.data.name === "search-2"
+          && running.data.label === "second life coworking lisbon" && running.data.outcome === "running" && running.data.started === t0 + 9100 && running.data.eventId === 9, JSON.stringify(running));
+    const completed = await frames.next();
+    check("its step_completed becomes an ok frame with the start it saw, and the output is never forwarded",
+          completed && completed.event === "step" && completed.data.outcome === "ok" && completed.data.started === t0 + 9100 && completed.data.ended === t0 + 15000
+          && !completed.raw.includes(SECRET) && !completed.raw.includes("output"), JSON.stringify(completed));
+    // The Workflow writes the question before the wait starts; the test writes it here.
+    const liveRow = db.tasks.find((t) => t.id === liveId);
+    liveRow.state = "awaiting_approval"; liveRow.question = JSON.stringify({ spoken: "This is a big one, about 16 searches. Go ahead?", askedAt: t0 + 15050, until: t0 + 86_400_000 }); liveRow.updated_at = t0 + 15050;
+    const waiting = await frames.next();
+    check("wait_started re-reads the row and sends it as a task frame, now awaiting with its question; ask-write was not a step frame",
+          waiting && waiting.event === "task" && waiting.data.id === liveId && waiting.data.state === "awaiting_approval"
+          && waiting.data.question.spoken.startsWith("This is a big one") && waiting.data.steps.length === 2, JSON.stringify(waiting));
+
+    // The re-read notices a task started elsewhere and a row deleted elsewhere.
+    const newId = "feed-new-1";
+    db.tasks.push({ ...db.tasks.find((t) => t.id === liveId), id: newId, state: "running", question: null, created_at: t0 + 20000, updated_at: t0 + 20000,
+                    input: JSON.stringify({ request: "Started on the phone", now: "x", tz: "UTC", taskVersion: 1 }), steps: "[]" });
+    tasks.instances.set(newId, { events: [], end: true });
+    db.tasks.splice(db.tasks.findIndex((t) => t.id === doneId), 1);
+    const subsBefore = tasks.log.filter((l) => l.call === "subscribe").length;
+    // Two pings' worth of timer: the interval is driven by hand.
+    const intervals = [];
+    const realSetInterval = globalThis.setInterval, realClearInterval = globalThis.clearInterval;
+    // (the stream's interval was created before this patch; drive it through a second feed below)
+    globalThis.setInterval = (fn, ms) => { const id = realSetInterval(fn, ms); intervals.push({ id, fn, ms, cleared: false }); return id; };
+    globalThis.clearInterval = (id) => { const i = intervals.find((x) => x.id === id); if (i) i.cleared = true; realClearInterval(id); };
+    const controller = new AbortController();
+    const second = await feed(deviceToken, { cursors: { [liveId]: 12, "bad id!": 3, [newId]: -1 } }, { signal: controller.signal });
+    const frames2 = frameReader(second);
+    const snap2 = await frames2.next();
+    check("a second client gets its own snapshot, and the ledger-less new row is labelled Planning",
+          snap2 && snap2.event === "snapshot" && snap2.data.tasks.length === 2 && snap2.data.tasks.find((t) => t.id === newId).steps.length === 0);
+    const subscribed = tasks.log.filter((l) => l.call === "subscribe").slice(subsBefore);
+    check("the reconnect cursor is passed through for the task that had one; a malformed id or cursor is dropped",
+          subscribed.some((l) => l.id === liveId && l.options && l.options.cursor === 12)
+          && subscribed.some((l) => l.id === newId && l.options === undefined), JSON.stringify(subscribed));
+    check("the stream created one interval of fifteen seconds", intervals.length === 1 && intervals[0].ms === 15000);
+    // Drive the interval by hand: a ping, then the re-read.
+    intervals[0].fn();
+    const ping = await frames2.next();
+    check("the first tick is a ping comment", ping && ping.comment === "ping", JSON.stringify(ping));
+    db.tasks.find((t) => t.id === newId).updated_at = t0 + 25000;
+    intervals[0].fn();
+    const ping2 = await frames2.next();
+    const changed = await frames2.next();
+    check("the second tick re-reads the rows: a changed row comes as a task frame",
+          ping2 && ping2.comment === "ping" && changed && changed.event === "task" && changed.data.id === newId && changed.data.updatedAt === t0 + 25000, JSON.stringify(changed));
+    db.tasks.splice(db.tasks.findIndex((t) => t.id === newId), 1);
+    // The re-read is every second tick: one ping alone, then a ping and the read.
+    intervals[0].fn(); await frames2.next();
+    intervals[0].fn(); await frames2.next();
+    const gone = await frames2.next();
+    check("a row deleted elsewhere comes as gone", gone && gone.event === "gone" && gone.data.id === newId, JSON.stringify(gone));
+    const disposedBefore = tasks.log.filter((l) => l.call === "dispose").length;
+    controller.abort();
+    await new Promise((r) => setTimeout(r, 20));
+    check("the client's abort disposes the subscriptions and clears the interval",
+          tasks.log.filter((l) => l.call === "dispose").length > disposedBefore && intervals[0].cleared === true,
+          `disposes ${tasks.log.filter((l) => l.call === "dispose").length - disposedBefore}, cleared ${intervals[0].cleared}`);
+    globalThis.setInterval = realSetInterval; globalThis.clearInterval = realClearInterval;
+    await frames.reader.cancel().catch(() => {});
+    check("nothing of the detail, the findings or the note's body reached the log", !logged.join("|").includes(SECRET));
+
+    // The list route carries the same projection.
+    db.tasks.push({ ...liveRow, id: "feed-list-1", state: "running", question: null });
+    const list = await (await post("/v1/tasks", deviceToken, {})).json();
+    const listed = list.tasks.find((t) => t.id === "feed-list-1");
+    check("the list route carries subject and labelled steps, and no detail",
+          listed && listed.subject === "Lisbon coworking day passes" && listed.steps.length === 2 && listed.steps[1].label === "lisbon coworking day pass"
+          && !JSON.stringify(list).includes(SECRET) && !JSON.stringify(list).includes("detail"), JSON.stringify(listed));
+    Date.now = realNowFeed;
   }
 
   // --- the header grammar and the summary

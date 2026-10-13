@@ -29,6 +29,9 @@ import {
   insertRow, readRow, deleteRow, markState, finishTask, taskRows, writeSummary,
   tasksHeaderFor, deleteInstance, terminateInstance,
 } from "./tasks/run.js";
+// The feed (A84): the account's tasks as server-sent events, and the one
+// projection the feed and the list share.
+import { openFeed, projectRow } from "./tasks/feed.js";
 
 const ANTHROPIC = "https://api.anthropic.com/v1/messages";
 const COMPOSIO = "https://backend.composio.dev/api/v3.1";
@@ -88,6 +91,7 @@ export default {
     if (url.pathname === "/v1/tasks/cancel") return cancelTask(request, env);
     if (url.pathname === "/v1/tasks/take") return takeTask(request, env);
     if (url.pathname === "/v1/tasks/delete") return deleteTask(request, env);
+    if (url.pathname === "/v1/tasks/feed") return feedTasks(request, env);
     if (url.pathname === "/v1/tasks") return listTasks(request, env);
 
     if (url.pathname !== "/v1/ask") return problem(404, "not_found");
@@ -1544,19 +1548,54 @@ async function listTasks(request, env) {
     console.error("task rows unreadable:", String(error && error.name || "error"));
     return problem(503, "not_provisioned");
   }
-  const tasks = rows.map((row) => {
-    let question = null, result = null;
-    try { question = row.question ? JSON.parse(row.question) : null; } catch { question = null; }
-    try { result = row.result ? JSON.parse(row.result) : null; } catch { result = null; }
-    return {
-      id: row.id, type: row.type, state: row.state, reason: row.reason || undefined,
-      createdAt: row.created_at, updatedAt: row.updated_at, finishedAt: row.finished_at || undefined,
-      seen: row.seen_at != null,
-      question: question ? { spoken: question.spoken, until: question.until } : undefined,
-      spoken: result && result.spoken ? result.spoken : undefined,
-    };
-  });
+  // The feed's projection (A84): the subject, the steps with their labels,
+  // the note's title — never the input beyond its first 120 characters,
+  // never the detail.
+  const tasks = rows.map(projectRow);
   return json200({ tasks }, await safeTasksHeader(env, accountId));
+}
+
+/**
+ * POST /v1/tasks/feed  { cursors?: { [id]: lastEventId } }  →  200 text/event-stream + otto-tasks
+ *
+ * One connection, held while Otto's panel is open (A84): a snapshot of the
+ * account's rows, then every step and state change as the platform's event
+ * log reports it, projected in src/tasks/feed.js. The body is optional; a
+ * reconnecting client sends the last event id it saw per task and the
+ * replay starts after it. The stream ends when the client goes.
+ */
+async function feedTasks(request, env) {
+  const auth = await authenticateAccount(request, env);
+  if (auth.refused) return auth.refused;
+  const accountId = auth.account.subject;
+  if (!env.TASKS) {
+    console.error("tasks are not provisioned: the TASKS binding is missing");
+    return problem(503, "not_provisioned");
+  }
+  let text = "";
+  try { text = await request.text(); } catch { text = ""; }
+  let body = {};
+  if (text.trim()) {
+    try { body = JSON.parse(text); } catch { return problem(400, "malformed_json"); }
+  }
+  const cursors = {};
+  if (body && typeof body === "object" && body.cursors && typeof body.cursors === "object") {
+    for (const [id, value] of Object.entries(body.cursors)) {
+      if (/^[A-Za-z0-9_-]{1,100}$/.test(id) && Number.isInteger(value) && value >= 0) cursors[id] = value;
+    }
+  }
+  const headers = await safeTasksHeader(env, accountId);
+  const stream = openFeed({ env, accountId, cursors, signal: request.signal });
+  console.log(`task feed opened (${Object.keys(cursors).length} cursors)`);
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      ...headers,
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store",
+      "connection": "keep-alive",
+    },
+  });
 }
 
 // -------------------------------------------------------------- validation

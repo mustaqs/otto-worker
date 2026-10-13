@@ -111,10 +111,14 @@ function guardedStep({ step, env, task, NonRetryableError }, name, fn, config = 
       await recordStep(env, task, { name, started, ended: Date.now(), outcome: "failed", error: word });
       throw error;
     }
-    // BEST-EFFORT. The work is done; the ledger must not undo it.
+    // BEST-EFFORT. The work is done; the ledger must not undo it. The label
+    // and the plan's queries are the only words a step hands the ledger
+    // (A84): the tab names steps from them, the feed never reads an output.
     await recordStep(env, task, {
       name, started, ended: Date.now(), outcome: "ok",
       ...(out && out.cost ? out.cost : {}),
+      ...(out && typeof out.label === "string" && out.label ? { label: out.label.slice(0, 80) } : {}),
+      ...(out && Array.isArray(out.queries) ? { queries: out.queries.slice(0, 20).map((q) => String(q).slice(0, 80)) } : {}),
     });
     return out;
   });

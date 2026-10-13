@@ -29,9 +29,10 @@ WF=src/tasks/workflow.js
 REG=src/tasks/registry.js
 RESEARCH=src/tasks/research.js
 SUMMARY=src/tasks/summary.js
+FEED=src/tasks/feed.js
 MAIN=src/main.js
 TOML=wrangler.toml
-PURE="$RUN $MODEL $REG $RESEARCH $SUMMARY"
+PURE="$RUN $MODEL $REG $RESEARCH $SUMMARY $FEED"
 
 fail=0
 check() {
@@ -39,7 +40,7 @@ check() {
     else printf '  FAIL %s\n' "$1"; fail=$((fail + 1)); fi
 }
 
-for f in $SRC $RUN $MODEL $WF $REG $RESEARCH $SUMMARY $MAIN $TOML; do
+for f in $SRC $RUN $MODEL $WF $REG $RESEARCH $SUMMARY $FEED $MAIN $TOML; do
     [ -f "$f" ] || { echo "FAIL: no $f"; exit 2; }
 done
 
@@ -61,7 +62,7 @@ echo "tasks — the key:"
 
 # FAILING EDIT: read env.ANTHROPIC_API_KEY in runResearch (research.js).
 in_index=$(grep -c "env\.ANTHROPIC_API_KEY" "$SRC")
-in_tasks=$(cat $RUN $MODEL $WF $REG $RESEARCH $SUMMARY | grep -c "env\.ANTHROPIC_API_KEY")
+in_tasks=$(cat $RUN $MODEL $WF $REG $RESEARCH $SUMMARY $FEED | grep -c "env\.ANTHROPIC_API_KEY")
 in_fn=$(body "$MODEL" anthropic | grep -c "env\.ANTHROPIC_API_KEY")
 if [ "$in_index" = "1" ] && [ "$in_tasks" = "1" ] && [ "$in_fn" = "1" ]; then
     check "the key is read once in index.js and once under src/tasks/, inside anthropic()" 0
@@ -185,9 +186,9 @@ check "wrangler's main is src/main.js, which re-exports the handler and OttoTask
 
 echo "tasks — the routes:"
 
-TASK_FUNCS="createTask approveTask cancelTask takeTask deleteTask listTasks taskFromBody"
+TASK_FUNCS="createTask approveTask cancelTask takeTask deleteTask listTasks feedTasks taskFromBody"
 # FAILING EDIT: replace authenticateAccount with authenticate in createTask.
-for fn in createTask listTasks taskFromBody; do
+for fn in createTask listTasks feedTasks taskFromBody; do
     case "$(body "$SRC" "$fn")" in
         *authenticateAccount*) check "$fn requires an account behind the bearer" 0 ;;
         *)                     check "$fn requires an account behind the bearer" 1 ;;
@@ -238,6 +239,48 @@ if [ -n "$seen_line" ] && [ -n "$del_line" ] && [ "$seen_line" -lt "$del_line" ]
 else
     check "takeTask marks the row seen before it deletes the instance" 1
 fi
+
+echo "tasks — the feed (A84):"
+
+# FAILING EDIT: call `instance.subscribe(` from listTasks in index.js, or
+# from a second function in feed.js.
+subs=$(cat $PURE "$SRC" | sed 's|//.*||' | grep -c "\.subscribe(")
+in_follow=$(body "$FEED" follow | sed 's|//.*||' | grep -c "\.subscribe(")
+if [ "$subs" = "1" ] && [ "$in_follow" = "1" ]; then
+    check "subscribe is called once, inside feed.js's follow" 0
+else
+    check "subscribe is called once, inside feed.js's follow" 1
+    printf '       calls: %s, inside follow: %s\n' "$subs" "$in_follow"
+fi
+
+# FAILING EDIT: forward `event.output` in a step frame, or read `result.detail`
+# in projectRow. A step's output is the findings; the detail is the write-up.
+! sed 's|//.*||' "$FEED" | grep -qE "\.output\b|\.detail\b|notes\.body|\.findings\b"
+check "the feed never reads a step's output, a result's detail, a note's body or the findings" $?
+
+# FAILING EDIT: add a second setInterval to feed.js, or drop the clearInterval
+# from close(). One timer per stream, cleared when the stream ends.
+sets=$(sed 's|//.*||' "$FEED" | grep -c "setInterval(")
+clears=$(body "$FEED" close | sed 's|//.*||' | grep -c "clearInterval(")
+if [ "$sets" = "1" ] && [ "$clears" = "1" ]; then
+    check "the feed has one interval, cleared in close()" 0
+else
+    check "the feed has one interval, cleared in close()" 1
+fi
+
+# FAILING EDIT: drop the `cancel()` handler from the ReadableStream, or the
+# abort listener. The client's disconnect must reach close() both ways.
+sed 's|//.*||' "$FEED" | grep -q "cancel() { close(); }" && sed 's|//.*||' "$FEED" | grep -q 'addEventListener("abort", close'
+check "the stream's cancel and the request's abort both close it" $?
+
+# FAILING EDIT: emit the "start" or "ask-write" step by widening SHOWN.
+grep -q '^export const SHOWN = /\^(plan|draft|search-\\d+)\$/;' "$FEED"
+check "the shown steps are plan, the searches and the draft; bookkeeping steps stay out" $?
+
+# FAILING EDIT: have guardedStep spread the whole `out` into the ledger entry.
+guarded=$(body "$RUN" guardedStep | sed 's|//.*||')
+echo "$guarded" | grep -q 'label: out.label.slice(0, 80)' && echo "$guarded" | grep -q 'queries: out.queries.slice(0, 20)' && ! echo "$guarded" | grep -q '\.\.\.out,' && ! echo "$guarded" | grep -q '\.\.\.out }'
+check "the ledger takes a step's label and the plan's queries, cut, and nothing else of its output" $?
 
 echo "tasks — no words in the log:"
 

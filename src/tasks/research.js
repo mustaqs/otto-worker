@@ -9,6 +9,7 @@
  * value, which the rules permit.
  */
 import { costOf, SPOKEN_MAX_CHARS, DETAIL_MAX_BYTES } from "./registry.js";
+import { LABEL_MAX } from "./feed.js";
 
 export const MAX_SEARCHES = 20;
 /**
@@ -64,7 +65,13 @@ export async function runResearch(ctx) {
       ? parsed.queries.filter((q) => typeof q === "string" && q.trim()).map((q) => q.trim()).slice(0, MAX_SEARCHES)
       : [];
     if (queries.length === 0) queries.push(request.slice(0, 200));
-    return { queries, outline: typeof parsed.outline === "string" ? parsed.outline.slice(0, 300) : "", cost: costOf(model, reply.usage) };
+    // `label` and `queries` ride into the ledger (guardedStep), so the tab can
+    // name every step without reading the instance (A84).
+    return {
+      queries, outline: typeof parsed.outline === "string" ? parsed.outline.slice(0, 300) : "",
+      label: `Planned ${queries.length} search${queries.length === 1 ? "" : "es"}`,
+      cost: costOf(model, reply.usage),
+    };
   }, { timeout: "2 minutes" });
 
   if (plan.queries.length > ctx.entry.askAboveSearches) {
@@ -85,6 +92,7 @@ export async function runResearch(ctx) {
       });
       return {
         query,
+        label: query.slice(0, LABEL_MAX),
         findings: reply.text.slice(0, FINDINGS_MAX_CHARS),
         citations: citationsOf(reply.blocks),
         searches: reply.usage.searches,
@@ -107,6 +115,7 @@ export async function runResearch(ctx) {
       title: str(parsed.title) || "Research",
       spoken: str(parsed.spoken) || "The research is done; the write-up is in your notes.",
       body: str(parsed.body) || reply.text,
+      label: "Writing it up",
       cost: costOf(model, reply.usage),
     };
   }, { timeout: "4 minutes" });

@@ -213,7 +213,7 @@ pure.
 
 Long-running work — minutes of steps, an hour's wait for a yes — runs on the
 relay as a Cloudflare Workflow and is delivered on the user's next question or
-panel open. Six routes, none of them the question path; every reply carries
+panel open. Seven routes, none of them the question path; every reply carries
 `otto-tasks`:
 
     POST /v1/tasks/create   { type, request, context?, document?, now, tz } → 200 { id, state: "created" }
@@ -221,7 +221,23 @@ panel open. Six routes, none of them the question path; every reply carries
     POST /v1/tasks/cancel   { id }                                           → 200 { id, state: "cancelled" }
     POST /v1/tasks/take     { id }                                           → 200 { id, type, state, reason?, result?, steps }
     POST /v1/tasks/delete   { id }                                           → 200 {}
-    POST /v1/tasks          {}                                               → 200 { tasks: [...] }
+    POST /v1/tasks          {}                                               → 200 { tasks: [projection, …] }
+    POST /v1/tasks/feed     { cursors?: { [id]: lastEventId } }             → 200 text/event-stream
+
+The feed (A84) is one connection held while Otto's panel is open: a
+`snapshot` frame of the account's rows, then the platform's own event log
+(`instance.subscribe()` on each unfinished Workflow) projected as `step`
+frames — name, label, running/ok/failed, times — and `task` frames when a
+row changes, `gone` when one is deleted elsewhere, a `: ping` comment every
+fifteen seconds and a re-read of the rows every thirty. A projection is
+`{ id, type, state, reason?, createdAt, updatedAt, finishedAt?, seen,
+subject, question?, spoken?, noteTitle?, steps: [{ name, label, outcome,
+started, ended? }] }`: the request's first 120 characters, never the
+write-up, never a finding — a step's `output` is not read. The labels come
+from the ledger, which since A84 carries each step's `label` and the plan's
+`queries`, cut at 80 characters. `src/tasks/feed.js`; `Bench/check-task-path.sh`
+asserts the single `subscribe` call, the one timer, and that no output or
+detail is read.
 
 `otto-tasks` is `v=1;running=1;awaiting=0;unseen=1;t=<id>:<state>:<type>;…;q=<id>:<sentence>;s=<id>:<sentence>`:
 counts, up to eight ids, the one pending question's sentence and up to two
