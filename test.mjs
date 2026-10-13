@@ -1371,7 +1371,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     clearCounter();
     const r = await post("/v1/tasks/create", deviceToken, goodBody);
     const id = (await r.json()).id; approvedId = id;
-    const eight = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    const eight = "abcdefghijklmnop".split("");   // sixteen, past askAboveSearches = 15
     script = [text(JSON.stringify({ queries: eight }), { input_tokens: 10, output_tokens: 10 })];
     script[0].before = () => advance(2 * MIN);
     for (const q of eight) script.push(searchReply(`found ${q}`, 1));
@@ -1390,7 +1390,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     const row = db.tasks.find((t) => t.id === id);
     const question = JSON.parse(rowWhileWaiting.question);
     check("more searches than askAboveSearches put the row in awaiting_approval with a question and the full 24-hour window",
-          rowWhileWaiting.state === "awaiting_approval" && question.spoken.includes("8 searches") && question.spoken.includes("roughly 40 cents") && question.until - question.askedAt === 24 * HOUR);
+          rowWhileWaiting.state === "awaiting_approval" && question.spoken === "This is a big one, about 16 searches. Go ahead?" && question.until - question.askedAt === 24 * HOUR);
     check("the summary carried the question while waiting", summaryWhileWaiting.awaiting.length === 1 && summaryWhileWaiting.awaiting[0].q === question.spoken);
     const wait = step.calls.find((c) => c.wait);
     check("the wait was for the approval type with the full 24-hour timeout", wait.config.type === "approval" && wait.config.timeout === `${24 * HOUR} ms`);
@@ -1410,7 +1410,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     clearCounter();
     const r = await post("/v1/tasks/create", deviceToken, goodBody);
     const id = (await r.json()).id;
-    const eight = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    const eight = "abcdefghijklmnop".split("");   // sixteen, past askAboveSearches = 15
     script = [text(JSON.stringify({ queries: eight }), { input_tokens: 10, output_tokens: 10 })];
     script[0].before = () => advance(2 * MIN);
     for (const q of eight) script.push(searchReply(`found ${q}`, 1));
@@ -1433,7 +1433,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     const row = db.tasks.find((t) => t.id === id);
     const askedAt = JSON.parse(parked.question).askedAt;
     check("the replay re-ran nothing that had finished: one plan call, and start, plan and ask-write served from the cache",
-          parked.state === "awaiting_approval" && modelCalls.length === 1 + 8 + 1
+          parked.state === "awaiting_approval" && modelCalls.length === 1 + eight.length + 1
           && step.calls.filter((c) => c.cached).map((c) => c.name).join(",") === "start,plan,ask-write", step.calls.map((c) => c.name + (c.cached ? "*" : "")).join(","));
     check("the wait's start survived the replay: waited_ms is the three hours, measured from the question's askedAt and not from the replay's clock",
           row.waited_ms >= 2 * HOUR + 58 * MIN && row.waited_ms < 3 * HOUR && clock - askedAt === row.waited_ms, `${row.waited_ms} vs ${clock - askedAt}`);
@@ -1459,7 +1459,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     clearCounter();
     const r = await post("/v1/tasks/create", deviceToken, goodBody);
     const id = (await r.json()).id;
-    const eight = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    const eight = "abcdefghijklmnop".split("");   // sixteen, past askAboveSearches = 15
     script = [text(JSON.stringify({ queries: eight }), { input_tokens: 10, output_tokens: 10 }), searchReply("never", 1)];
     modelCalls.length = 0;
     const step = makeStep([{ payload: { decision: "decline" }, before: async () => { await post("/v1/tasks/approve", deviceToken, { id, decision: "decline" }); } }]);
@@ -1476,7 +1476,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     clearCounter();
     const r = await post("/v1/tasks/create", deviceToken, goodBody);
     const id = (await r.json()).id;
-    script = [text(JSON.stringify({ queries: ["a", "b", "c", "d", "e", "f", "g"] }), { input_tokens: 10, output_tokens: 10 })];
+    script = [text(JSON.stringify({ queries: "abcdefghijklmnop".split("") }), { input_tokens: 10, output_tokens: 10 })];   // sixteen: past the threshold, so it asks
     const step = makeStep([]);   // nothing arrives: the stand-in throws its timeout
     await runWorkflow(id, step);
     const row = db.tasks.find((t) => t.id === id);
@@ -1486,7 +1486,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     clearCounter();
     const r2 = await post("/v1/tasks/create", deviceToken, goodBody);
     const id2 = (await r2.json()).id;
-    script = [text(JSON.stringify({ queries: ["a", "b", "c", "d", "e", "f", "g"] }), { input_tokens: 10, output_tokens: 10 })];
+    script = [text(JSON.stringify({ queries: "abcdefghijklmnop".split("") }), { input_tokens: 10, output_tokens: 10 })];
     const step2 = makeStep([{ throw: Object.assign(new Error("engine restarted"), { name: "WorkflowError" }) }]);
     await runWorkflow(id2, step2);
     const row2 = db.tasks.find((t) => t.id === id2);
@@ -1616,8 +1616,8 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
           s.length === 2 && decodeURIComponent(s[0].slice("s=id-2:".length)) === "Done one." && decodeURIComponent(s[1].slice("s=id-3:".length)) === "The research ran out of time.", s.join(" "));
     check("the whole header stays under 1,500 bytes", new TextEncoder().encode(h).byteLength < 1500, String(new TextEncoder().encode(h).byteLength));
     check("no rows is present with zeros", tasksHeader(summaryFromRows([], t0))["otto-tasks"] === "v=1;running=0;awaiting=0;unseen=0");
-    check("research is bounded to its maxSteps on the longest path: plan, twelve searches, draft, start and finish",
-          1 + 1 + 12 + 1 + 1 + 2 <= TYPES.research.maxSteps);   // start, plan, 12 searches, ask-write/ask-read, draft, finish
+    check("research is bounded to its maxSteps on the longest path: start, plan, the ask's two, twenty searches, draft and finish",
+          1 + 1 + 2 + 20 + 1 + 1 <= TYPES.research.maxSteps);
   }
 
   Date.now = realNow;

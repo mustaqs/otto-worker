@@ -10,7 +10,7 @@
  */
 import { costOf, SPOKEN_MAX_CHARS, DETAIL_MAX_BYTES } from "./registry.js";
 
-export const MAX_SEARCHES = 12;
+export const MAX_SEARCHES = 20;
 /**
  * What one search step may hand the draft. Measured on the first live run
  * (27ad6d37, 2026-10-11): each step's findings ran to about 2,150 output
@@ -34,7 +34,7 @@ export const WEB_SEARCH = {
 };
 
 const PLAN_SYSTEM = `You plan a short piece of research for a voice assistant's user. \
-Reply with JSON only: {"queries": ["…"], "outline": "one line"}. Between two and twelve \
+Reply with JSON only: {"queries": ["…"], "outline": "one line"}. Between two and twenty \
 web search queries, each specific enough to return useful pages. No prose outside the JSON.`;
 
 const SEARCH_SYSTEM = `You research one question for a voice assistant's user using web search. \
@@ -68,7 +68,9 @@ export async function runResearch(ctx) {
   }, { timeout: "2 minutes" });
 
   if (plan.queries.length > ctx.entry.askAboveSearches) {
-    await ctx.ask(`This needs about ${plan.queries.length} searches, roughly ${plan.queries.length * ctx.entry.centsPerSearch} cents. Go ahead?`);
+    // No cents in the question (A83's first run): the number of searches is
+    // what the user can weigh; the estimate was wrong by 3x once and is gone.
+    await ctx.ask(`This is a big one, about ${plan.queries.length} searches. Go ahead?`);
   }
 
   const findings = [];

@@ -690,6 +690,12 @@ test file.
 
 ## 10. What this checkpoint does not decide
 
+- **The ask is for the big ones, decided 2026-10-12 at A83's first manual
+  run.** `askAboveSearches` 6 → 15, the plan may run to twenty searches
+  (`MAX_SEARCHES` 20, `maxSteps` 28), and the question drops the cents —
+  "This is a big one, about N searches. Go ahead?" — because the estimate had
+  been wrong by 3x once and the count is what a user can weigh.
+  `centsPerSearch` is gone. Branch `tasks-ask-fifteen`.
 - **Cancel and decline are seen, decided 2026-10-12 at the app's design
   checkpoint (A83, P4).** `cancelTask` finishes the row with `seen_at` set
   and a decline's `markState` sets it before the Workflow finishes the row,

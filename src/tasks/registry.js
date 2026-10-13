@@ -37,10 +37,9 @@ export const TYPES = {
     },
     needsDocument: false,
     approvalTimeout: "24 hours",
-    askAboveSearches: 6,
-    centsPerSearch: 5,       // the question's all-in estimate per planned search: 29.5 cents for six on the bounded step's first live run (f97f67a0, 2026-10-12); it was 8.9 before the bounds
+    askAboveSearches: 15,    // the one approval: a plan past this many searches asks first (raised from 6 on 2026-10-12, A83's run: the question is for the big ones)
     maxDurationMs: 30 * 60 * 1000,
-    maxSteps: 20,
+    maxSteps: 28,            // start, plan, ask-write, ask-read, up to 20 searches, draft, finish = 26; the test counts the longest path
     costClass: "model",
     model: "claude-sonnet-5",
     retention: "3 days",

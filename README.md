@@ -247,9 +247,9 @@ device, `unknown_type`, `document_not_allowed`, `task_limit` past the plan's
 
 The one type so far is `research`: plan, up to twelve direct web searches on
 `claude-sonnet-5`, a draft, a note for the app to file. A search step may
-search twice and hands the draft at most 4,096 characters; it asks once at
-most, before spending more than six searches, quoting the registry's
-`centsPerSearch` (5, the all-in figure measured on the bounded step). Setup, out of band:
+search twice and hands the draft at most 4,096 characters; a plan may run to
+twenty searches, and past fifteen it asks once — "This is a big one, about N
+searches. Go ahead?" — with no cents in the question. Setup, out of band:
 
     wrangler d1 migrations apply otto --remote    # 0005_tasks.sql
     wrangler deploy                               # registers the otto-tasks Workflow from [[workflows]]
