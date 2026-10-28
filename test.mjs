@@ -5,7 +5,7 @@
  * would fail loudly in use; buffering would not — it would just make Otto feel
  * slow, and the cause would be three layers away from the symptom.
  */
-import worker from "./src/index.js";
+import worker, { classifyUpstream } from "./src/index.js";
 
 let failures = 0;
 // A parked promise with nothing else pending drains node's loop and the file
@@ -170,6 +170,42 @@ console.log("limits:");
   check("a failed upstream call still counts against the cap",
         counted.store.get(`u:${goodToken}:d:${day}`) === "1");
   globalThis.fetch = async () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
+}
+
+// ------------------------------------------------------- upstream rejections
+
+console.log("when Anthropic rejects a call (2026-10-28's outage):");
+{
+  const credit = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "Your credit balance is too low to access the Anthropic API. SECRETWORDS" } });
+  const bad = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "messages: field required SECRETWORDS" } });
+  const over = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } });
+  check("credit exhausted is the provider's side, and billing", (() => { const c = classifyUpstream(400, credit); return c.provider && c.billing && c.type === "invalid_request_error"; })());
+  check("a malformed request is not", !classifyUpstream(400, bad).provider);
+  check("overload, 529, 5xx, 429 and a bad key are the provider's side",
+        classifyUpstream(529, over).provider && classifyUpstream(500, "x").provider && classifyUpstream(429, "").provider && classifyUpstream(401, "").provider);
+  check("an unreadable body is type unknown", classifyUpstream(502, "<html>").type === "unknown");
+
+  const logged = [];
+  const realError = console.error;
+  console.error = (...a) => logged.push(a.map(String).join(" "));
+  try {
+    const kv = makeKV({ [`token:${goodToken}`]: account() });
+    globalThis.fetch = async () => new Response(credit, { status: 400, headers: { "content-type": "application/json" } });
+    const r1 = await send(env(kv));
+    const b1 = await r1.json();
+    check("the question answers 503 provider_unavailable, with the upstream status", r1.status === 503 && b1.error === "provider_unavailable" && b1.upstreamStatus === 400);
+    globalThis.fetch = async () => new Response(bad, { status: 400 });
+    const r2 = await send(env(kv));
+    check("a request the provider refused as malformed is still upstream_error", r2.status === 400 && (await r2.json()).error === "upstream_error");
+  } finally { console.error = realError; }
+  check("the log names the status and the type, and billing", logged.includes("upstream refused the question: HTTP 400, invalid_request_error, billing")
+        && logged.includes("upstream refused the question: HTTP 400, invalid_request_error"));
+  check("and never the provider's message", !logged.join("|").includes("SECRETWORDS") && !logged.join("|").includes("credit balance"));
+  globalThis.fetch = async () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
+
+  const { endedSentence } = await import("./src/tasks/summary.js");
+  check("a checkpoint names the site, and gives the tab back", endedSentence("browser", "failed", "checkpoint", "news.ycombinator.com") === "news.ycombinator.com wants to check you're human — the tab is yours.");
+  check("an extension missing from the profile says which profile", endedSentence("browser", "failed", "extension_missing", "x.com") === "Stopped — Otto's Chrome extension isn't in the Chrome profile you used last.");
 }
 
 // ------------------------------------------------------------------- usage
@@ -1422,7 +1458,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
           failedEntry && failedEntry.outcome === "failed" && failedEntry.error === "model_http_400" && typeof failedEntry.started === "number" && typeof failedEntry.ended === "number"
           && steps.filter((s) => s.outcome === "failed").length === 1, JSON.stringify(steps));
     check("the log named the status, the step and the reason, and nothing else",
-          logged.includes("task model call: HTTP 400") && logged.includes("task research step plan failed: model_http_400") && logged.includes("task research ended failed: step_failed"));
+          logged.includes("task model call: HTTP 400, unknown") && logged.includes("task research step plan failed: model_http_400") && logged.includes("task research ended failed: step_failed"));
   }
 
   // --- approval (correction 1: asked at minute 2, approved at hour 3)

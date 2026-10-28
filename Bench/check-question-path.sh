@@ -95,6 +95,16 @@ else
     printf '       missing:    %s\n' "$(comm -13 <(echo "$seen") <(echo "$expected") | tr '\n' ' ')"
 fi
 
+# A REJECTION IS READ FOR ITS TYPE AND STATUS ONLY (2026-10-28). The body of
+# a failed upstream call is read in upstreamRefusal and nowhere else on the
+# path; its log line carries the status, the type and a billing flag, never
+# the message or the text.
+# FAILING EDIT: add `${text}` or `${error.message}` to upstreamRefusal's console.error.
+refusal=$(body upstreamRefusal)
+echo "$refusal" | grep -q 'console.error(`upstream refused the ${where}: HTTP ${upstream.status}, ${type}${billing ? ", billing" : ""}`);' \
+    && ! echo "$refusal" | grep 'console\.' | grep -qE '\$\{(text|message|error)'
+check "an upstream rejection is logged by status and type, never by its message" $?
+
 # Registration writes D1, and must NOT be mistaken for part of the path. This
 # asserts the separation is real rather than assumed: if registerDevice ever
 # stops touching D1, someone has moved entitlement writes somewhere worse.

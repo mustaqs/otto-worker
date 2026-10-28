@@ -193,9 +193,10 @@ export default {
     });
 
     if (!upstream.ok) {
-      // The status is forwarded; the body is not read, so an upstream error
-      // message never passes through this Worker's memory as a string.
-      return problem(upstream.status, "upstream_error");
+      // A REJECTION IS CLASSIFIED, AND ITS WORDS ARE NOT KEPT: the error
+      // body's type and the status are logged (an outage shows its cause),
+      // the message is never logged or forwarded (upstreamRefusal).
+      return upstreamRefusal(upstream, "question");
     }
 
     /*
@@ -1672,7 +1673,7 @@ async function askStep(request, env, ctx, t0 = Date.now()) {
     },
     body: JSON.stringify(body),
   });
-  if (!upstream.ok) return problem(upstream.status, "upstream_error");
+  if (!upstream.ok) return upstreamRefusal(upstream, "browser step");
   const upstreamMs = Date.now() - beforeUpstream;
   // PASS-THROUGH, as the question's stream is: the body is handed on
   // untouched, never read, buffered or counted here.
@@ -1944,6 +1945,42 @@ function problem(status, code, extra = {}, headers = {}) {
       ...headers,
     },
   });
+}
+
+/**
+ * WHEN ANTHROPIC REJECTS A CALL. Read only on failure — a successful body is
+ * never read here — and only for two facts:
+ *   - the error's `type` and the HTTP status, logged, so an outage shows its
+ *     cause (2026-10-28: every question failed for want of credit, and the
+ *     relay's log said only "400");
+ *   - whether it is the provider's side — an outage, overload, rate limit,
+ *     the key or the account's billing — which is `provider_unavailable`,
+ *     so the app says "I'm having trouble on my end" rather than blaming the
+ *     request.
+ * The message is matched for billing words and then dropped: never logged,
+ * never forwarded. Everything else is `upstream_error`, as before.
+ */
+export function classifyUpstream(status, text) {
+  let type = "unknown", billing = false;
+  try {
+    const error = (JSON.parse(text) || {}).error || {};
+    if (typeof error.type === "string" && /^[a-z_]{1,40}$/.test(error.type)) type = error.type;
+    billing = /credit balance|billing|payment|spend limit|usage limit/i.test(String(error.message || ""));
+  } catch { /* an unreadable body is "unknown" */ }
+  const provider = billing || [401, 403, 429, 500, 502, 503, 504, 529].includes(status)
+    || ["overloaded_error", "api_error", "rate_limit_error", "authentication_error", "permission_error", "billing_error"].includes(type);
+  return { type, billing, provider };
+}
+
+async function upstreamRefusal(upstream, where) {
+  let text = "";
+  try { text = (await upstream.text()).slice(0, 4096); } catch { text = ""; }
+  const { type, billing, provider } = classifyUpstream(upstream.status, text);
+  text = "";
+  console.error(`upstream refused the ${where}: HTTP ${upstream.status}, ${type}${billing ? ", billing" : ""}`);
+  return provider
+    ? problem(503, "provider_unavailable", { upstreamStatus: upstream.status })
+    : problem(upstream.status, "upstream_error");
 }
 
 /**

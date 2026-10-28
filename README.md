@@ -28,7 +28,11 @@ an implementation that buffers.
 the response body, which is the single most likely way to reintroduce
 buffering. Counting requests means the Worker never reads a response body on
 the question path, so pass-through streaming holds by construction rather than
-by care. A task step (A82, below) is a different path and must read the
+by care. The one exception is a rejection: when Anthropic refuses a call, its
+error JSON is read for its type and status, which are logged, and the call is
+answered `provider_unavailable` when the cause is on the provider's side
+(outage, overload, rate limit, key, billing). The message is never logged or
+forwarded, and a successful body is never read. A task step (A82, below) is a different path and must read the
 model's answer and its usage; that is the second and last reader of the key,
 and `Bench/check-task-path.sh` asserts there is no third.
 

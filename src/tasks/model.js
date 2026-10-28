@@ -33,7 +33,10 @@ export async function anthropic(env, model, { system, messages, tools, maxTokens
     throw new Error("model_unreachable");
   }
   if (!response.ok) {
-    console.error(`task model call: HTTP ${response.status}`);
+    // The type and the status, never the message (index.js classifyUpstream's rule).
+    let type = "unknown";
+    try { const t = ((await response.json()) || {}).error || {}; if (/^[a-z_]{1,40}$/.test(t.type || "")) type = t.type; } catch { /* unknown */ }
+    console.error(`task model call: HTTP ${response.status}, ${type}`);
     throw new Error(`model_http_${response.status}`);
   }
   const json = await response.json();
