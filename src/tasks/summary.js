@@ -48,6 +48,8 @@ function browserEnded(state, reason) {
   if (state === "expired") return "The browser task waited too long for an answer and stopped.";
   if (reason === "max_duration") return "Stopped — that took more than thirty minutes.";
   if (reason === "step_limit") return "Stopped — that took more than twenty-five steps.";
+  if (reason === "call_limit") return "Stopped — that took too many tries.";
+  if (reason === "step_cap") return "Stopped — that's all the browser steps for today.";
   return "The browser task failed partway.";
 }
 

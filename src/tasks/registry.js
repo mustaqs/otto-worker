@@ -15,6 +15,13 @@ import { runBrowser, renderBrowser } from "./browser.js";
 /** Steps the Mac may post in one browser task (A89): the step route refuses the 26th. */
 export const BROWSER_MAX_STEPS = 25;
 
+/**
+ * Model calls the Mac may make for one browser task (A89 §11): one a step
+ * and five to spare for a retried call. /v1/tasks/ask counts them on the row
+ * and refuses the thirty-first.
+ */
+export const BROWSER_MAX_CALLS = 30;
+
 /** Rides in every instance's params, so a later reader of a row can tell which code ran it. */
 export const TASK_VERSION = 1;
 

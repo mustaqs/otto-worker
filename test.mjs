@@ -1012,7 +1012,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     [`token:${otherToken}`]: JSON.stringify({ v: 2, subject: "acct-other", kind: "device", plan: "free", active: true, dailyCap: 50, hourlyCap: 20, trialCap: 0 }),
     [`token:${trialToken}`]: JSON.stringify({ v: 2, subject: trialToken, kind: "trial", plan: "trial", active: true, dailyCap: 10, hourlyCap: 10, trialCap: 10 }),
   });
-  const plans = { free: { name: "free", daily_cap: 50, hourly_cap: 20, trial_cap: 0, tool_cap: 0, task_cap: 2 } };
+  const plans = { free: { name: "free", daily_cap: 50, hourly_cap: 20, trial_cap: 0, tool_cap: 0, task_cap: 2, step_cap: 4 } };
 
   // A D1 stand-in with a tasks table. One UPDATE shape to parse:
   // `UPDATE tasks SET a = ?, b = ? WHERE id = ? AND account_id = ?`.
@@ -1028,6 +1028,13 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
         return {
           first: async () => {
             if (q.includes("FROM plans")) return plans[args[0]] || null;
+            // A89 §11's count-and-check, in one statement with RETURNING.
+            if (q.startsWith("UPDATE tasks SET calls = calls + 1 WHERE id = ? AND account_id = ? AND type = 'browser'")) {
+              const row = tasks.find((t) => t.id === args[0] && t.account_id === args[1]);
+              if (!row || row.type !== "browser" || !["created", "running", "approved"].includes(row.state) || row.calls >= args[2]) return null;
+              row.calls += 1;
+              return { steps: row.steps, created_at: row.created_at, waited_ms: row.waited_ms, calls: row.calls };
+            }
             if (q.startsWith("SELECT * FROM tasks WHERE id = ? AND account_id = ?")) {
               const row = tasks.find((t) => t.id === args[0] && t.account_id === args[1]);
               return row ? { ...row } : null;
@@ -1047,7 +1054,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
             if (q.startsWith("INSERT INTO tasks")) {
               const [id, account_id, type, input, created_at, updated_at] = args;
               tasks.push({ id, account_id, type, state: "created", input, steps: "[]", question: null, answer: null, result: null,
-                           reason: null, waited_ms: 0, seen_at: null, created_at, updated_at, finished_at: null, expires_at: null });
+                           reason: null, waited_ms: 0, calls: 0, seen_at: null, created_at, updated_at, finished_at: null, expires_at: null });
               return;
             }
             if (q.startsWith("UPDATE tasks SET")) {
@@ -1155,8 +1162,12 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
   // The model, scripted. Each entry: { content, usage } or { status } with an optional `before`.
   let script = [];
   const modelCalls = [];
+  const streamCalls = [];   // the pass-through's upstream calls: /v1/ask and /v1/tasks/ask
   const anthropicDone = () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
   globalThis.fetch = async (url, init = {}) => {
+    if (String(url) === "https://api.anthropic.com/v1/messages" && init.body && JSON.parse(init.body).stream) {
+      streamCalls.push({ body: JSON.parse(init.body), headers: init.headers });
+    }
     if (String(url) === "https://api.anthropic.com/v1/messages" && init.body && !JSON.parse(init.body).stream) {
       const body = JSON.parse(init.body);
       modelCalls.push({ body, headers: init.headers });
@@ -1978,6 +1989,117 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     await stepPost(deviceToken, { id: jGone.id, n: 1, kind: "end", reason: "browser_closed" });
     check("Chrome closing fails the task with its reason, not seen", rowOf(jGone.id).state === "failed" && !rowOf(jGone.id).seen_at
           && endedSentence("browser", "failed", "browser_closed") === "Stopped — Chrome was closed.");
+    // --- a browser step's model call (A89 §11): /v1/tasks/ask
+    {
+      const stepModelBody = { model: "claude-sonnet-5-5", max_tokens: 1024, stream: true,
+                              messages: [{ role: "user", content: `Page outline: ${PAGE}` }] };
+      const askStep = async (token, id, n, body = stepModelBody) => {
+        const ctx = makeCtx();
+        const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+        if (id !== undefined) headers["otto-task"] = id;
+        if (n !== undefined) headers["otto-step"] = String(n);
+        const r = await worker.fetch(new Request("https://w/v1/tasks/ask", { method: "POST", headers, body: JSON.stringify(body) }), envTasks, ctx);
+        await ctx.settle();
+        return r;
+      };
+      const day = new Date(clock).toISOString().slice(0, 10);
+      const stepKey = `u:${accountId}:s:${day}`, questionKey = `u:${accountId}:d:${new Date().toISOString().slice(0, 10)}`;
+      const clearSteps = () => kv.store.delete(stepKey);
+      clearSteps();
+
+      const { j: jCall } = await create();
+      const callId = jCall.id;
+      const questionsBefore = kv.store.get(questionKey);
+      const upstreamBefore = streamCalls.length;
+      const a1 = await askStep(deviceToken, callId, 1);
+      const sent1 = streamCalls[streamCalls.length - 1];
+      check("a browser step's call streams through, on a 5.5 model, with the relay's key",
+            a1.status === 200 && streamCalls.length === upstreamBefore + 1 && sent1.body.model === "claude-sonnet-5-5"
+            && sent1.headers["x-api-key"] === envTasks.ANTHROPIC_API_KEY);
+      check("the body is passed on untouched", JSON.stringify(sent1.body) === JSON.stringify(stepModelBody));
+      check("it is counted on the task's row and on the day's step counter, not the question counter",
+            rowOf(callId).calls === 1 && kv.store.get(stepKey) === "1" && kv.store.get(questionKey) === questionsBefore);
+      check("its D1 round is reported in server-timing, every call", /(^|, )d1;dur=\d+/.test(a1.headers.get("server-timing") || ""));
+      check("and the page sent to the model is never in the ledger",
+            !rowOf(callId).steps.includes(PAGE) && !rowOf(callId).input.includes(PAGE) && !logged.join("|").includes(PAGE));
+      check("a step's call must be for the next step", (await askStep(deviceToken, callId, 2)).status === 409);
+      await stepPost(deviceToken, { id: callId, n: 1, kind: "step", label: "Read the orders" });
+      check("and is taken for the next one once a step is posted", (await askStep(deviceToken, callId, 2)).status === 200 && rowOf(callId).calls === 3);
+      check("a retried call for the same step is taken, inside the bound", (await askStep(deviceToken, callId, 2)).status === 200);
+
+      // the allowlists: the 5.5 models here only
+      check("a model outside the step allowlist is refused", (await askStep(deviceToken, callId, 2, { ...stepModelBody, model: "claude-fable-5" })).status === 400);
+      const q55 = await worker.fetch(new Request("https://w/v1/ask", { method: "POST",
+        headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ ...stepModelBody, model: "claude-opus-5-5" }) }), envTasks, makeCtx());
+      check("the question path still refuses the 5.5 models", q55.status === 400 && (await q55.json()).error === "model_not_allowed");
+
+      // who may call, and for what
+      const callsBefore = rowOf(callId).calls;
+      check("another account's task is not found, and its count is untouched",
+            (await askStep(otherToken, callId, 2)).status === 404 && rowOf(callId).calls === callsBefore);
+      check("a trial device is refused", (await askStep(trialToken, callId, 2)).status === 403);
+      check("a call that names no task, or no step, is refused",
+            (await askStep(deviceToken, undefined, 1)).status === 400 && (await askStep(deviceToken, callId, undefined)).status === 400
+            && (await askStep(deviceToken, callId, "two")).status === 400);
+      clearCounter();
+      const { j: jResearch } = await (async () => { const r = await post("/v1/tasks/create", deviceToken, goodBody); return { j: await r.json() }; })();
+      const notBrowser = await askStep(deviceToken, jResearch.id, 1);
+      check("a research task's id is refused: not_browser", notBrowser.status === 400 && (await notBrowser.json()).error === "not_browser");
+      const finished = await askStep(deviceToken, jEnd.id, 2);
+      check("a finished task refuses calls", finished.status === 409 && (await finished.json()).error === "already_finished");
+      const { j: jGoneIdle } = await create();
+      rowOf(jGoneIdle.id).state = "expired"; rowOf(jGoneIdle.id).reason = "idle";
+      check("an expired task refuses calls", (await askStep(deviceToken, jGoneIdle.id, 1)).status === 409);
+      const { j: jHeld } = await create({ mode: "act" });
+      rowOf(jHeld.id).state = "awaiting_approval";
+      const heldCall = await askStep(deviceToken, jHeld.id, 1);
+      check("a task waiting for a yes refuses calls", heldCall.status === 409 && (await heldCall.json()).error === "awaiting_approval");
+
+      // the bounds end the task
+      const { j: jMany } = await create();
+      rowOf(jMany.id).calls = 30;
+      const manyCall = await askStep(deviceToken, jMany.id, 1);
+      check("the thirty-first call ends the task", manyCall.status === 409 && (await manyCall.json()).error === "call_limit"
+            && rowOf(jMany.id).state === "failed" && rowOf(jMany.id).reason === "call_limit"
+            && tasks.log.some((l) => l.id === jMany.id && l.call === "terminate")
+            && endedSentence("browser", "failed", "call_limit") === "Stopped — that took too many tries.");
+      const { j: jLong } = await create();
+      rowOf(jLong.id).created_at = clock - 31 * MIN;
+      const longCall = await askStep(deviceToken, jLong.id, 1);
+      check("a call past thirty minutes of working time ends the task", longCall.status === 409 && rowOf(jLong.id).reason === "max_duration");
+      const { j: jCap } = await create();
+      kv.store.set(stepKey, "4");
+      const capped = await askStep(deviceToken, jCap.id, 1);
+      const cappedBody = await capped.json();
+      check("the day's step_cap refuses the next call with 429 and ends the task",
+            capped.status === 429 && cappedBody.error === "step_limit" && cappedBody.cap === 4 && cappedBody.resetsAt > clock
+            && rowOf(jCap.id).reason === "step_cap" && endedSentence("browser", "failed", "step_cap") === "Stopped — that's all the browser steps for today.");
+      clearSteps();
+      const capBefore = plans.free.step_cap;
+      delete plans.free.step_cap;
+      const { j: jClosed } = await create();
+      check("with no step_cap on the plan the call fails closed", (await askStep(deviceToken, jClosed.id, 1)).status === 503);
+      plans.free.step_cap = capBefore;
+
+      // NOT A WAY ROUND THE QUESTION CAP
+      kv.store.set(questionKey, "50");
+      const qCapped = await worker.fetch(new Request("https://w/v1/ask", { method: "POST",
+        headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ ...stepModelBody, model: "claude-sonnet-5" }) }), envTasks, makeCtx());
+      const dodge = await askStep(deviceToken, undefined, 1, { ...stepModelBody, model: "claude-sonnet-5" });
+      const dodgeOld = await askStep(deviceToken, jEnd.id, 1, { ...stepModelBody, model: "claude-sonnet-5" });
+      check("with the question cap reached, the step route is no way round it: no task, or a finished one, is refused",
+            qCapped.status === 429 && dodge.status === 400 && dodgeOld.status === 409);
+      const stepsBefore = kv.store.get(stepKey);
+      const qOk = await worker.fetch(new Request("https://w/v1/ask", { method: "POST",
+        headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ ...stepModelBody, model: "claude-sonnet-5" }) }), envTasks, makeCtx());
+      check("and a question never touches the step counter", kv.store.get(stepKey) === stepsBefore && qOk.status === 429);
+      kv.store.delete(questionKey);
+      clearSteps();
+    }
+
     check("ledgerText strips a right-to-left override too", ledgerText(`a${rlo}b`, 10) === "ab");
     check("nothing of a page or a query reached the log", !logged.join("|").includes(PAGE) && !logged.join("|").includes(QUERY));
     clearCounter();

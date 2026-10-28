@@ -61,15 +61,18 @@ strip() { sed 's|//.*||' "$@"; }
 
 echo "tasks — the key:"
 
-# FAILING EDIT: read env.ANTHROPIC_API_KEY in runResearch (research.js).
+# THREE READERS SINCE A89 §11: the question's pass-through, the browser
+# step's pass-through (askStep), and anthropic() for the Workflow.
+# FAILING EDIT: read env.ANTHROPIC_API_KEY in runResearch (research.js), or in stepTask.
 in_index=$(grep -c "env\.ANTHROPIC_API_KEY" "$SRC")
-in_tasks=$(cat $RUN $MODEL $WF $REG $RESEARCH $SUMMARY $FEED | grep -c "env\.ANTHROPIC_API_KEY")
+in_askstep=$(body "$SRC" askStep | grep -c "env\.ANTHROPIC_API_KEY")
+in_tasks=$(cat $RUN $MODEL $WF $REG $RESEARCH $BROWSER $SUMMARY $FEED | grep -c "env\.ANTHROPIC_API_KEY")
 in_fn=$(body "$MODEL" anthropic | grep -c "env\.ANTHROPIC_API_KEY")
-if [ "$in_index" = "1" ] && [ "$in_tasks" = "1" ] && [ "$in_fn" = "1" ]; then
-    check "the key is read once in index.js and once under src/tasks/, inside anthropic()" 0
+if [ "$in_index" = "2" ] && [ "$in_askstep" = "1" ] && [ "$in_tasks" = "1" ] && [ "$in_fn" = "1" ]; then
+    check "the key is read twice in index.js (the question, askStep) and once under src/tasks/, inside anthropic()" 0
 else
-    check "the key is read once in index.js and once under src/tasks/, inside anthropic()" 1
-    printf '       index.js: %s, src/tasks: %s, inside anthropic(): %s\n' "$in_index" "$in_tasks" "$in_fn"
+    check "the key is read twice in index.js (the question, askStep) and once under src/tasks/, inside anthropic()" 1
+    printf '       index.js: %s, askStep: %s, src/tasks: %s, inside anthropic(): %s\n' "$in_index" "$in_askstep" "$in_tasks" "$in_fn"
 fi
 
 echo "tasks — the question path:"
@@ -317,6 +320,35 @@ check "the step bound and the working-time bound end the task from the route" $?
 guarded=$(body "$RUN" guardedStep | sed 's|//.*||')
 echo "$guarded" | grep -q 'label: out.label.slice(0, 80)' && echo "$guarded" | grep -q 'queries: out.queries.slice(0, 20)' && ! echo "$guarded" | grep -q '\.\.\.out,' && ! echo "$guarded" | grep -q '\.\.\.out }'
 check "the ledger takes a step's label and the plan's queries, cut, and nothing else of its output" $?
+
+echo "a browser step's model call (A89 §11):"
+askstep=$(body "$SRC" askStep | sed 's|//.*||')
+# FAILING EDIT: drop `AND account_id = ?` or `AND calls < ?` from countCall, or add 'awaiting_approval' to its states.
+count=$(body "$RUN" countCall | sed 's|//.*||' | tr -s ' \n' ' ')
+echo "$count" | grep -q "UPDATE tasks SET calls = calls + 1 WHERE id = ? AND account_id = ? AND type = 'browser' AND state IN ('created', 'running', 'approved') AND calls < ? RETURNING"
+check "a call is counted and checked in one statement: own account, a browser task, alive, not waiting for a yes, under the bound" $?
+# FAILING EDIT: add "claude-opus-5-5" to ALLOWED_MODELS, or validate askStep against ALLOWED_MODELS.
+allowed=$(awk '/^const ALLOWED_MODELS = new Set\(\[/,/^\]\);/' "$SRC")
+stepmodels=$(awk '/^const STEP_MODELS = new Set\(\[/,/^\]\);/' "$SRC")
+! echo "$allowed" | grep -q -- '-5-5"' && echo "$stepmodels" | grep -q '"claude-opus-5-5"' \
+    && echo "$askstep" | grep -q 'validate(body, env, STEP_MODELS)' \
+    && [ "$(strip "$SRC" | grep -c 'validate(body, env)')" = "1" ]
+check "the 5.5 models are in STEP_MODELS alone, which only askStep validates against; the question's validate is unchanged" $?
+# FAILING EDIT: call checkLimits or counterKeys from askStep.
+! echo "$askstep" | grep -qE 'checkLimits|counterKeys|dayKey|hourKey|totalKey'
+check "askStep never reads or writes the question counters" $?
+# FAILING EDIT: drop the `plan.step_cap === undefined` guard.
+echo "$askstep" | grep -q 'if (!plan || plan.step_cap === undefined || plan.step_cap === null) return problem(503, "not_provisioned");' \
+    && echo "$askstep" | grep -q 'if (!counted) return refuseStepCall(env, task);' \
+    && echo "$askstep" | grep -q 'if (n !== expected) return problem(409, "out_of_order"'
+check "a call needs the plan's step_cap (fails closed), a counted row, and the next step" $?
+# FAILING EDIT: route /v1/tasks/ask to the question handler, or read otto-task in the fetch handler.
+grep -q 'if (url.pathname === "/v1/tasks/ask") return askStep(request, env, ctx, t0);' "$SRC" \
+    && [ "$(strip "$SRC" | grep -c 'headers.get("otto-task")')" = "1" ] && echo "$askstep" | grep -q 'headers.get("otto-task")'
+check "/v1/tasks/ask is its own route; otto-task is read in askStep alone" $?
+# FAILING EDIT: replace `return new Response(upstream.body,` in askStep with a buffered read.
+echo "$askstep" | grep -q 'return new Response(upstream.body, {' && ! echo "$askstep" | grep -qE 'upstream\.(text|json|arrayBuffer)\(|tee\('
+check "the step's stream is passed through, never read" $?
 
 echo "tasks — no words in the log:"
 

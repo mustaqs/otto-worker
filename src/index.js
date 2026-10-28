@@ -23,7 +23,7 @@ import {
 // which checkLimits feeds from a KV key — Bench/check-task-path.sh.
 import {
   TYPES, TASK_VERSION, CREATE_KEYS, REQUEST_MAX_CHARS, CONTEXT_MAX_CHARS, DOCUMENT_MAX_BYTES,
-  BROWSER_MODES, URL_MAX_CHARS, BROWSER_MAX_STEPS, SPOKEN_MAX_CHARS,
+  BROWSER_MODES, URL_MAX_CHARS, BROWSER_MAX_STEPS, BROWSER_MAX_CALLS, SPOKEN_MAX_CHARS,
 } from "./tasks/registry.js";
 import {
   STEP_KEYS, STEP_KINDS, STEP_BODY_MAX_BYTES, STEP_LABEL_MAX, STEP_SENTENCE_MAX, ledgerText, stepsOf,
@@ -31,7 +31,7 @@ import {
 import { tasksHeader, TERMINAL, BROWSER_END_REASONS } from "./tasks/summary.js";
 import {
   insertRow, readRow, deleteRow, markState, finishTask, taskRows, writeSummary,
-  tasksHeaderFor, deleteInstance, terminateInstance, appendStep,
+  tasksHeaderFor, deleteInstance, terminateInstance, appendStep, countCall,
 } from "./tasks/run.js";
 // The feed (A84): the account's tasks as server-sent events, and the one
 // projection the feed and the list share.
@@ -54,6 +54,17 @@ const ALLOWED_MODELS = new Set([
   "claude-opus-5",
   "claude-sonnet-5",
   "claude-haiku-4-5",
+]);
+
+/**
+ * Models a browser step may ask for (A89 §11): the question's three and the
+ * 5.5 models, on /v1/tasks/ask ONLY. The question's set above is unchanged.
+ */
+const STEP_MODELS = new Set([
+  ...ALLOWED_MODELS,
+  "claude-opus-5-5",
+  "claude-sonnet-5-5",
+  "claude-haiku-5-5",
 ]);
 
 export default {
@@ -99,6 +110,9 @@ export default {
     if (url.pathname === "/v1/tasks/feed") return feedTasks(request, env);
     // A89: the Mac's browser loop records each step it takes.
     if (url.pathname === "/v1/tasks/step") return stepTask(request, env);
+    // A89 §11: a browser step's model call — its own route, counter and
+    // allowlist, so /v1/ask is exactly what it was.
+    if (url.pathname === "/v1/tasks/ask") return askStep(request, env, ctx, t0);
     if (url.pathname === "/v1/tasks") return listTasks(request, env);
 
     if (url.pathname !== "/v1/ask") return problem(404, "not_found");
@@ -1560,6 +1574,147 @@ async function stepTask(request, env) {
   return json200({ id, n, state: row.state }, await safeTasksHeader(env, task.accountId));
 }
 
+/**
+ * POST /v1/tasks/ask  (a Messages body, as /v1/ask takes it)
+ *   + otto-task: <id>, otto-step: <n>  →  200 text/event-stream, passed through
+ *
+ * A89 §11: the model call for step n of a browser task. NOT /v1/ask, so the
+ * question path, its counters and its allowlist are exactly what they were;
+ * and not a header on /v1/ask, which would have put a task read on that path
+ * or trusted a KV copy up to a minute stale.
+ *
+ * WHY IT CANNOT CARRY ORDINARY QUESTIONS. A call lands only for the account's
+ * own browser task that is alive and not waiting for a yes, for the next step
+ * the ledger expects, inside the task's thirty minutes, under thirty calls a
+ * task (counted on the row in the same statement that checks it) and under
+ * the plan's step_cap a day. So the most a free account can get through here
+ * is step_cap calls a day, each spent inside a task it started, which counts
+ * on the task cap — not a way round the question counter.
+ *
+ * In order: the bearer must have an account; the headers must name a task and
+ * a step; the body is bounded and validated as a question's is, against
+ * STEP_MODELS; then ONE round of reads in parallel — the row's count and
+ * check, the plan's step_cap, the day's counter — then the stream. The D1
+ * time is reported in server-timing as `d1`, so the cost of that round is
+ * measured on every call rather than argued.
+ */
+async function askStep(request, env, ctx, t0 = Date.now()) {
+  const auth = await authenticateAccount(request, env);
+  if (auth.refused) return auth.refused;
+  const accountId = auth.account.subject;
+  const id = request.headers.get("otto-task") || "";
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(id)) return problem(400, "bad_request", { field: "otto-task" });
+  const n = Number(request.headers.get("otto-step"));
+  if (!Number.isInteger(n) || n < 1) return problem(400, "bad_request", { field: "otto-step" });
+
+  // Bounded before it is parsed, as the question is.
+  const maxBody = Number(env.MAX_BODY_BYTES) || 6_000_000;
+  if (Number(request.headers.get("content-length")) > maxBody) return problem(413, "body_too_large");
+  let body;
+  try {
+    const raw = await request.arrayBuffer();
+    if (raw.byteLength > maxBody) return problem(413, "body_too_large");
+    body = JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return problem(400, "malformed_json");
+  }
+  const rejection = validate(body, env, STEP_MODELS);
+  if (rejection) return rejection;
+
+  const task = { id, accountId };
+  const now = new Date(Date.now());
+  const stepDayKey = `u:${accountId}:s:${now.toISOString().slice(0, 10)}`;
+  const tD1 = Date.now();
+  let counted, plan, used;
+  try {
+    [counted, plan, used] = await Promise.all([
+      countCall(env, task, BROWSER_MAX_CALLS),
+      env.DB.prepare(`SELECT step_cap FROM plans WHERE name = ?`).bind(auth.account.plan).first(),
+      env.OTTO.get(stepDayKey),
+    ]);
+  } catch (error) {
+    console.error("browser step call not counted:", String(error && error.name || "error"));
+    return problem(503, "not_provisioned");
+  }
+  const d1Ms = Date.now() - tD1;
+  // FAILS CLOSED: no plan row, or no step_cap column, is no call.
+  if (!plan || plan.step_cap === undefined || plan.step_cap === null) return problem(503, "not_provisioned");
+
+  if (!counted) return refuseStepCall(env, task);
+  const ended = async (reason, status, code, extra = {}) => {
+    await terminateInstance(env, task.id);
+    await finishTask(env, task, "failed", { reason });
+    console.log(`task browser ended: ${reason}`);
+    return problem(status, code, extra, await safeTasksHeader(env, accountId));
+  };
+  const expected = stepsOf(counted).length + 1;
+  if (n !== expected) return problem(409, "out_of_order", { expected });
+  if (Date.now() - Number(counted.created_at) - (Number(counted.waited_ms) || 0) > TYPES.browser.maxDurationMs) {
+    return ended("max_duration", 409, "max_duration");
+  }
+  const stepCap = Number(plan.step_cap) || 0;
+  const today = Number(used) || 0;
+  if (stepCap > 0 && today >= stepCap) {
+    const resetsAt = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+    return ended("step_cap", 429, "step_limit", { cap: stepCap, resetsAt });
+  }
+  // Off the critical path, as the question's increment is; the per-task
+  // bound above is the exact one, this is the day's.
+  defer(ctx, env.OTTO.put(stepDayKey, String(today + 1), { expirationTtl: 60 * 60 * 48 }), "step counter increment");
+
+  const beforeUpstream = Date.now();
+  const upstream = await fetch(ANTHROPIC, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!upstream.ok) return problem(upstream.status, "upstream_error");
+  const upstreamMs = Date.now() - beforeUpstream;
+  // PASS-THROUGH, as the question's stream is: the body is handed on
+  // untouched, never read, buffered or counted here.
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      "otto-steps": `${today + 1}/${stepCap}; calls=${counted.calls}/${BROWSER_MAX_CALLS}`,
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-store",
+      "connection": "keep-alive",
+      "server-timing": [
+        `d1;dur=${d1Ms}`,
+        `upstream;dur=${upstreamMs}`,
+        `relay;dur=${Date.now() - t0 - upstreamMs}`,
+      ].join(", "),
+    },
+  });
+}
+
+/** Why a browser step's call was not counted, read from the row. */
+async function refuseStepCall(env, task) {
+  let row;
+  try { row = await readRow(env, task); } catch (error) {
+    console.error("task row unreadable:", String(error && error.name || "error"));
+    return problem(503, "not_provisioned");
+  }
+  // ANOTHER ACCOUNT'S TASK IS NOT FOUND, as on every task route.
+  if (!row) return problem(404, "not_found");
+  if (row.type !== "browser") return problem(400, "not_browser");
+  const headers = await safeTasksHeader(env, task.accountId);
+  if (TERMINAL.has(row.state)) return problem(409, "already_finished", { state: row.state }, headers);
+  if (row.state === "awaiting_approval") return problem(409, "awaiting_approval", {}, headers);
+  if ((Number(row.calls) || 0) >= BROWSER_MAX_CALLS) {
+    // THE BOUND ENDS THE TASK, as the step bound does.
+    await terminateInstance(env, task.id);
+    await finishTask(env, task, "failed", { reason: "call_limit" });
+    console.log("task browser ended: call_limit");
+    return problem(409, "call_limit", {}, await safeTasksHeader(env, task.accountId));
+  }
+  return problem(409, "not_running", { state: row.state }, headers);
+}
+
 /** The row named in the body, for this account, or the refusal. */
 async function taskFromBody(request, env) {
   const auth = await authenticateAccount(request, env);
@@ -1751,9 +1906,9 @@ async function feedTasks(request, env) {
  * abuse a little further and couple every prompt change to a Worker deploy,
  * which is the wrong trade while the prompt is still being tuned.
  */
-function validate(body, env) {
+function validate(body, env, models = ALLOWED_MODELS) {
   if (typeof body !== "object" || body === null) return problem(400, "bad_request");
-  if (!ALLOWED_MODELS.has(body.model)) return problem(400, "model_not_allowed");
+  if (!models.has(body.model)) return problem(400, "model_not_allowed");
   if (body.stream !== true) return problem(400, "stream_required");
 
   const maxOutput = Number(env.MAX_OUTPUT_TOKENS) || 4096;

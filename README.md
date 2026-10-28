@@ -213,8 +213,8 @@ pure.
 
 Long-running work — minutes of steps, an hour's wait for a yes — runs on the
 relay as a Cloudflare Workflow and is delivered on the user's next question or
-panel open. Seven routes, none of them the question path; every reply carries
-`otto-tasks`:
+panel open. Nine routes, none of them the question path; every reply but
+`ask`'s carries `otto-tasks`:
 
     POST /v1/tasks/create   { type, request, context?, document?, now, tz } → 200 { id, state: "created" }
     POST /v1/tasks/approve  { id, decision: "approve" | "decline" }        → 200 { id, state }
@@ -223,6 +223,18 @@ panel open. Seven routes, none of them the question path; every reply carries
     POST /v1/tasks/delete   { id }                                           → 200 {}
     POST /v1/tasks          {}                                               → 200 { tasks: [projection, …] }
     POST /v1/tasks/feed     { cursors?: { [id]: lastEventId } }             → 200 text/event-stream
+    POST /v1/tasks/step     { id, n, kind, label?, sentence?, answer?, reason? } → 200 { id, n, state }
+    POST /v1/tasks/ask      a Messages body + otto-task, otto-step headers   → 200 text/event-stream
+
+Browser tasks (A89) add the last two. `step` is the Mac's ledger post: seven
+keys under 2 KB, cleaned of invisible characters and URL queries, so page
+text has nowhere to go. `ask` is a browser step's model call, the
+question's pass-through on a route of its own: it lands only for the
+account's own running browser task and the step the ledger expects, is
+counted on the row (thirty a task, in the statement that checks it) and on
+the day against the plan's `step_cap`, may use the 5.5 models — which
+`/v1/ask` still refuses — and never touches the question counters. Its
+`server-timing` carries `d1`, the time of its one round of reads.
 
 The feed (A84) is one connection held while Otto's panel is open: a
 `snapshot` frame of the account's rows, then the platform's own event log

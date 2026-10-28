@@ -241,6 +241,21 @@ export async function insertRow(env, row) {
   ).bind(row.id, row.accountId, row.type, JSON.stringify(row.input), row.createdAt, row.createdAt).run();
 }
 
+/**
+ * A89 §11: one model call of a browser task, counted on its row in ONE
+ * statement that is also the check. It lands only for the account's own
+ * browser task, alive and not waiting for a yes, under the call bound; the
+ * row comes back with the count, so the caller learns the steps without a
+ * second read. Null means refused, and the caller reads the row to say why.
+ */
+export async function countCall(env, task, max) {
+  return env.DB.prepare(
+    `UPDATE tasks SET calls = calls + 1 WHERE id = ? AND account_id = ? AND type = 'browser'
+     AND state IN ('created', 'running', 'approved') AND calls < ?
+     RETURNING steps, created_at, waited_ms, calls`
+  ).bind(task.id, task.accountId, max).first();
+}
+
 /** `UPDATE tasks SET a = ?, b = ?, updated_at = ? WHERE id = ? AND account_id = ?` — one shape, so the test's stand-in parses one shape. */
 async function updateRow(env, task, fields) {
   const entries = Object.entries(fields).filter(([, v]) => v !== undefined);
