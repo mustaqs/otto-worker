@@ -32,6 +32,7 @@ import {
 // The feed (A84): the account's tasks as server-sent events, and the one
 // projection the feed and the list share.
 import { openFeed, projectRow } from "./tasks/feed.js";
+import { cleanTitle, fallbackTitle } from "./tasks/title.js";
 
 const ANTHROPIC = "https://api.anthropic.com/v1/messages";
 const COMPOSIO = "https://backend.composio.dev/api/v3.1";
@@ -1363,6 +1364,10 @@ async function createTask(request, env) {
 
   const text = typeof body.request === "string" ? body.request.trim() : "";
   if (!text || text.length > REQUEST_MAX_CHARS) return problem(400, "bad_request", { field: "request" });
+  if (body.title !== undefined && typeof body.title !== "string") return problem(400, "bad_request", { field: "title" });
+  // The model's short title (A91), bounded to six words; a create without
+  // one is named by its request, cut at a word boundary.
+  const title = cleanTitle(body.title) || fallbackTitle(text);
   const context = typeof body.context === "string" ? body.context.trim().slice(0, CONTEXT_MAX_CHARS) : "";
   const now = typeof body.now === "string" && !Number.isNaN(new Date(body.now).getTime()) ? body.now : null;
   if (!now) return problem(400, "bad_request", { field: "now" });
@@ -1386,12 +1391,15 @@ async function createTask(request, env) {
   const taskCap = plan ? Number(plan.task_cap) || 0 : 0;
   const { taskDayKey } = counterKeys(accountId, new Date());
   const used = Number(await env.OTTO.get(taskDayKey)) || 0;
-  if (taskCap > 0 && used >= taskCap) return problem(429, "task_limit", {}, await safeTasksHeader(env, accountId));
+  // The day is UTC (counterKeys), so the cap resets at the next UTC midnight;
+  // the app says when in the user's own clock (A91).
+  const resetsAt = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate() + 1);
+  if (taskCap > 0 && used >= taskCap) return problem(429, "task_limit", { cap: taskCap, resetsAt }, await safeTasksHeader(env, accountId));
   await env.OTTO.put(taskDayKey, String(used + 1), { expirationTtl: 60 * 60 * 48 });
 
   const id = crypto.randomUUID();
   const createdAt = Date.now();
-  const input = { request: text, ...(context ? { context } : {}), ...(document !== undefined ? { document } : {}), now, tz, taskVersion: TASK_VERSION };
+  const input = { request: text, title, ...(context ? { context } : {}), ...(document !== undefined ? { document } : {}), now, tz, taskVersion: TASK_VERSION };
   try {
     await insertRow(env, { id, accountId, type, input, createdAt });
   } catch (error) {

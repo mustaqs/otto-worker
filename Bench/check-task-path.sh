@@ -219,9 +219,11 @@ grep -A12 "research: {" "$REG" | grep -q "needsDocument: false"
 check "and research does not" $?
 
 # FAILING EDIT: add "image" to CREATE_KEYS, or remove the allowlist loop.
-grep -q 'CREATE_KEYS = \["type", "request", "context", "document", "now", "tz"\]' "$REG" \
-    && echo "$create" | grep -q "CREATE_KEYS.includes(key)"
-check "the create body is an allowlist of six keys, so an image has no name to arrive under" $?
+# Seven since A91 added `title`, which is text, checked as text, and bounded.
+grep -q 'CREATE_KEYS = \["type", "request", "title", "context", "document", "now", "tz"\]' "$REG" \
+    && echo "$create" | grep -q "CREATE_KEYS.includes(key)" \
+    && echo "$create" | grep -q 'typeof body.title !== "string"'
+check "the create body is an allowlist of seven keys, so an image has no name to arrive under" $?
 
 # FAILING EDIT: drop `seen: true` from cancelTask's finishTask, or the
 # `seen: decision === "decline"` from approveTask's markState. A row the user

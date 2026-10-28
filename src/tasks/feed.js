@@ -21,6 +21,7 @@
  */
 import { TERMINAL } from "./summary.js";
 import { taskRows, readRow } from "./run.js";
+import { titleOf } from "./title.js";
 
 export const SUBJECT_MAX = 120;
 export const LABEL_MAX = 80;
@@ -77,6 +78,9 @@ export function projectRow(row) {
     ...(row.finished_at ? { finishedAt: Number(row.finished_at) } : {}),
     seen: row.seen_at != null,
     subject: cut(input.request, SUBJECT_MAX),
+    // The name the task goes by everywhere (A91); the request cut at a word
+    // boundary for a task created before titles.
+    title: titleOf(input),
     ...(question && question.spoken ? { question: { spoken: question.spoken, until: Number(question.until) || 0 } } : {}),
     ...(result && result.spoken ? { spoken: result.spoken } : {}),
     ...(notes && typeof notes.title === "string" && notes.title ? { noteTitle: notes.title } : {}),

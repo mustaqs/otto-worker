@@ -22,7 +22,8 @@ export const PRICES = {
 };
 
 /** The body keys /v1/tasks/create accepts. An allowlist, so an image can never arrive under a name of its own (A60). */
-export const CREATE_KEYS = ["type", "request", "context", "document", "now", "tz"];
+// `title` (A91): the model's short name for the task, at most six words.
+export const CREATE_KEYS = ["type", "request", "title", "context", "document", "now", "tz"];
 export const REQUEST_MAX_CHARS = 4000;
 export const CONTEXT_MAX_CHARS = 300;
 export const DOCUMENT_MAX_BYTES = 32768;

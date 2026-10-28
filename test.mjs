@@ -1222,9 +1222,29 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     const j1 = await r1.json();
     const row = db.tasks.find((t) => t.id === j1.id);
     check("a good create answers the id and `created`", r1.status === 200 && typeof j1.id === "string" && j1.state === "created", JSON.stringify(j1));
-    check("the row holds exactly the six input fields and the task version",
+    check("the row holds exactly the input fields, the title and the task version",
           row && row.state === "created" && JSON.stringify(Object.keys(JSON.parse(row.input)).sort())
-            === JSON.stringify(["context", "now", "request", "taskVersion", "tz"]) && JSON.parse(row.input).taskVersion === TASK_VERSION);
+            === JSON.stringify(["context", "now", "request", "taskVersion", "title", "tz"]) && JSON.parse(row.input).taskVersion === TASK_VERSION);
+    check("a create without a title is named by its request, cut at a word boundary (A91)",
+          JSON.parse(row.input).title === "How do Swift actors handle reentrancy…", JSON.parse(row.input).title);
+    clearCounter();
+    const titled = await (await post("/v1/tasks/create", deviceToken, { ...goodBody, title: "  Swift actor   reentrancy " })).json();
+    check("the model's title is stored, whitespace tidied (A91)",
+          JSON.parse(db.tasks.find((t) => t.id === titled.id).input).title === "Swift actor reentrancy");
+    clearCounter();
+    const long = await (await post("/v1/tasks/create", deviceToken, { ...goodBody, title: "GMT watches under five thousand dollars with a date window" })).json();
+    check("a title past six words is cut to six, marked as cut (A91)",
+          JSON.parse(db.tasks.find((t) => t.id === long.id).input).title === "GMT watches under five thousand dollars…");
+    const notText = await post("/v1/tasks/create", deviceToken, { ...goodBody, title: 7 });
+    check("a title that is not text is bad_request", notText.status === 400 && (await notText.json()).field === "title");
+    // Out of the fixture again, so the block below counts as it did before titles.
+    for (const id of [titled.id, long.id]) {
+      db.tasks.splice(db.tasks.findIndex((t) => t.id === id), 1);
+      tasks.created.splice(tasks.created.findIndex((c) => c.id === id), 1);
+    }
+    // Back to the one create r1 counted, as the block below expects.
+    clearCounter();
+    kv.store.set([...kv.store.keys()].find((k) => k.startsWith(`u:${accountId}:k:`)) || `u:${accountId}:k:${new Date().toISOString().slice(0, 10)}`, "1");
     const created = tasks.created[0];
     check("the instance was created with the row's id, the params and the row's retention",
           created && created.id === j1.id && created.params.type === "research" && created.params.accountId === accountId
@@ -1235,7 +1255,11 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
 
     await post("/v1/tasks/create", deviceToken, goodBody);
     const third = await post("/v1/tasks/create", deviceToken, goodBody);
-    check("the plan's task cap refuses the third create and creates no instance", third.status === 429 && (await third.json()).error === "task_limit" && tasks.created.length === 2);
+    const thirdBody = await third.json();
+    check("the plan's task cap refuses the third create and creates no instance", third.status === 429 && thirdBody.error === "task_limit" && tasks.created.length === 2);
+    const midnight = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate() + 1);
+    check("the refusal names the cap and when it resets: the next UTC midnight (A91)",
+          thirdBody.cap === 2 && thirdBody.resetsAt === midnight, JSON.stringify(thirdBody));
     check("the refusal still carries the header", header(third).startsWith("v=1;running=2;"));
     clearCounter();
     // The second task is not run; it is deleted so the rest of the block sees one.
@@ -1709,6 +1733,8 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
           && done.steps[0].label === "Planned 2 searches" && done.steps[1].label === "wirecutter standing desk"
           && done.steps[2].label === "reddit desk wobble" && done.steps[2].outcome === "failed" && done.steps[3].label === "Writing it up"
           && done.steps[1].started === t0 + 1000 && done.steps[1].ended === t0 + 9000, JSON.stringify(done && done.steps));
+    check("a row from before titles is named by its request's first clause, cut at a word boundary (A91)",
+          done && done.title === "Best standing desks…" && !done.title.includes(SECRET), done && done.title);
     check("a ledger without labels is labelled from the name and the plan's queries",
           live && live.steps.map((s) => s.label).join("|") === "Planned 2 searches|lisbon coworking day pass", JSON.stringify(live && live.steps));
     check("nothing of the detail, the note's body or the findings is in the snapshot", !snapshot.raw.includes(SECRET) && !snapshot.raw.includes("detail") && !snapshot.raw.includes("body"));
