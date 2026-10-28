@@ -26,7 +26,7 @@ import {
   BROWSER_MODES, URL_MAX_CHARS, BROWSER_MAX_STEPS, BROWSER_MAX_CALLS, SPOKEN_MAX_CHARS,
 } from "./tasks/registry.js";
 import {
-  STEP_KEYS, STEP_KINDS, STEP_BODY_MAX_BYTES, STEP_LABEL_MAX, STEP_SENTENCE_MAX, ledgerText, stepsOf,
+  STEP_KEYS, STEP_KINDS, STEP_BODY_MAX_BYTES, STEP_LABEL_MAX, STEP_SENTENCE_MAX, ANSWER_MAX, ledgerText, stepsOf,
 } from "./tasks/browser.js";
 import { tasksHeader, TERMINAL, BROWSER_END_REASONS } from "./tasks/summary.js";
 import {
@@ -1503,7 +1503,7 @@ async function stepTask(request, env) {
   if (!kind) return problem(400, "bad_request", { field: "kind" });
   const label = typeof body.label === "string" ? ledgerText(body.label, STEP_LABEL_MAX) : "";
   const sentence = typeof body.sentence === "string" ? ledgerText(body.sentence, STEP_SENTENCE_MAX) : "";
-  const answer = typeof body.answer === "string" ? ledgerText(body.answer, SPOKEN_MAX_CHARS) : "";
+  const answer = typeof body.answer === "string" ? ledgerText(body.answer, ANSWER_MAX) : "";
   if ((kind === "step" || kind === "approval") && !label) return problem(400, "bad_request", { field: "label" });
   if (kind === "approval" && !sentence) return problem(400, "bad_request", { field: "sentence" });
   if (kind === "finish" && !answer) return problem(400, "bad_request", { field: "answer" });

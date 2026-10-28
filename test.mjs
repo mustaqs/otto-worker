@@ -205,7 +205,7 @@ console.log("when Anthropic rejects a call (2026-10-28's outage):");
 
   const { endedSentence } = await import("./src/tasks/summary.js");
   check("a checkpoint names the site, and gives the tab back", endedSentence("browser", "failed", "checkpoint", "news.ycombinator.com") === "news.ycombinator.com wants to check you're human — the tab is yours.");
-  check("an extension missing from the profile says which profile", endedSentence("browser", "failed", "extension_missing", "x.com") === "Stopped — Otto's Chrome extension isn't in the Chrome profile you used last.");
+  check("an extension missing from the profile says which profile", endedSentence("browser", "failed", "extension_missing", "x.com") === "Stopped — Otto's Chrome extension isn't installed or turned on in the Chrome profile you used last.");
 }
 
 // ------------------------------------------------------------------- usage
@@ -1103,6 +1103,9 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
               const row = tasks.find((t) => t.id === args[cols.length] && t.account_id === args[cols.length + 1]);
               // A89's compare-and-set: `… AND steps = ?` lands only if the list is unchanged.
               if (row && q.includes("AND steps = ?") && row.steps !== args[cols.length + 2]) return { meta: { changes: 0 } };
+              // The first ending wins: a finished row is left as it finished.
+              if (row && q.includes("AND state NOT IN ('succeeded', 'failed', 'cancelled', 'expired')")
+                  && ["succeeded", "failed", "cancelled", "expired"].includes(row.state)) return { meta: { changes: 0 } };
               if (row) cols.forEach((c, i) => { row[c] = args[i]; });
               return { meta: { changes: row ? 1 : 0 } };
             }
@@ -2136,6 +2139,28 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
       clearSteps();
     }
 
+    // --- step 4: the first ending wins, and a long answer is filed
+    {
+      const { finishTask } = await import("./src/tasks/run.js");
+      const { renderBrowser, ANSWER_MAX } = await import("./src/tasks/browser.js");
+      const { j: jRace } = await create();
+      await stepPost(deviceToken, { id: jRace.id, n: 1, kind: "end", reason: "user_closed_tab" });
+      await finishTask(envTasks, { id: jRace.id, accountId }, "failed", { reason: "step_failed" });
+      check("the user's close stays the ending when a late step's failure finishes it again (the race of 2026-10-28)",
+            rowOf(jRace.id).state === "cancelled" && rowOf(jRace.id).reason === "user_closed_tab");
+      const short = renderBrowser({ answer: "The top story is Gemini 4 Carbon.", title: "HN" });
+      check("a short answer is said whole and nothing is filed", short.spoken === "The top story is Gemini 4 Carbon." && !short.deliver);
+      const long = "The top three stories are Gemini 4 Carbon, CNC Stone Carving and Dayjob. " + "More detail follows here. ".repeat(20);
+      const filed = renderBrowser({ answer: long, title: "Hacker News top three" });
+      check("a long answer is said as its first sentence and filed whole under the task's title",
+            filed.spoken === "The top three stories are Gemini 4 Carbon, CNC Stone Carving and Dayjob." && filed.deliver.notes.title === "Hacker News top three"
+            && filed.deliver.notes.body === long.trim() && filed.detail === long.trim());
+      const { j: jLong } = await create();
+      const posted = await stepPost(deviceToken, { id: jLong.id, n: 1, kind: "finish", answer: long });
+      const kept = stepsOf(rowOf(jLong.id)).find((s) => s.kind === "finish");
+      check(`the step route keeps an answer up to ${ANSWER_MAX} characters, so the long one reaches the notes`,
+            posted.status === 200 && kept && kept.answer.length === long.trim().replace(/\s+/g, " ").length);
+    }
     check("ledgerText strips a right-to-left override too", ledgerText(`a${rlo}b`, 10) === "ab");
     check("nothing of a page or a query reached the log", !logged.join("|").includes(PAGE) && !logged.join("|").includes(QUERY));
     clearCounter();

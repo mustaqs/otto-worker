@@ -257,10 +257,12 @@ export async function countCall(env, task, max) {
 }
 
 /** `UPDATE tasks SET a = ?, b = ?, updated_at = ? WHERE id = ? AND account_id = ?` — one shape, so the test's stand-in parses one shape. */
-async function updateRow(env, task, fields) {
+async function updateRow(env, task, fields, { unlessFinished = false } = {}) {
   const entries = Object.entries(fields).filter(([, v]) => v !== undefined);
   entries.push(["updated_at", Date.now()]);
-  const sql = `UPDATE tasks SET ${entries.map(([k]) => `${k} = ?`).join(", ")} WHERE id = ? AND account_id = ?`;
+  // A FINISHED ROW STAYS AS IT FINISHED: the first final state wins.
+  const guard = unlessFinished ? " AND state NOT IN ('succeeded', 'failed', 'cancelled', 'expired')" : "";
+  const sql = `UPDATE tasks SET ${entries.map(([k]) => `${k} = ?`).join(", ")} WHERE id = ? AND account_id = ?${guard}`;
   await env.DB.prepare(sql).bind(...entries.map(([, v]) => v), task.id, task.accountId).run();
 }
 
@@ -340,7 +342,11 @@ export async function finishTask(env, task, state, { result, reason, seen } = {}
   // THE USER'S OWN CANCEL IS ALREADY SEEN. A row the user ended knowingly
   // must not come back on the next chord as "The research was cancelled."
   if (seen) fields.seen_at = now;
-  await updateRow(env, task, fields);
+  // THE FIRST ENDING IS THE ENDING (found 2026-10-28): the user closed
+  // Otto's tab, the Mac posted the end, and a step posted a moment earlier
+  // then failed to reach the terminated instance and wrote "failed" over
+  // the user's own cancel. Whatever finishes a row first is what it says.
+  await updateRow(env, task, fields, { unlessFinished: true });
   await writeSummary(env, task.accountId);
 }
 

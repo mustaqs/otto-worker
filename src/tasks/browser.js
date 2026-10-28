@@ -34,8 +34,11 @@ export function stepsOf(row) {
 export function ledgerView(row) {
   const steps = stepsOf(row);
   const last = steps[steps.length - 1] || null;
+  let title = "";
+  try { title = String(JSON.parse((row && row.input) || "{}").title || ""); } catch { title = ""; }
   return {
     count: steps.length,
+    title,
     last: last ? { n: Number(last.name.slice(5)), kind: last.kind, ask: last.ask || null, answer: last.answer || null } : null,
   };
 }
@@ -49,7 +52,7 @@ export async function runBrowser(ctx) {
     const view = await ctx.step(`read-${i}`, async () => ledgerView(await ctx.row()), { record: false });
     const last = view.last;
     if (!last) continue;
-    if (last.kind === "finish") return { answer: last.answer || "" };
+    if (last.kind === "finish") return { answer: last.answer || "", title: view.title };
     if (last.kind === "approval" && last.ask && !asked.has(last.n)) {
       asked.add(last.n);
       // THE EXTENSION'S SENTENCE, VERBATIM (A89 §6): built from what the
@@ -61,10 +64,21 @@ export async function runBrowser(ctx) {
   throw Object.assign(new Error("step_limit"), { name: "TaskStepLimit" });
 }
 
-/** The answer, said once on the next question; nothing is filed. */
+/** How long a finished answer may be: the spoken sentence, or more to file. */
+export const ANSWER_MAX = 1500;
+
+/**
+ * The answer, said once on the next question (A83, A91). A short one is said
+ * whole and nothing is filed. A long one — past one spoken sentence's 240
+ * characters — is said as its first sentence, and the whole answer is filed
+ * to the user's notes under the task's title, as research is.
+ */
 export function renderBrowser(out) {
-  const spoken = (typeof (out && out.answer) === "string" ? out.answer.trim() : "").slice(0, SPOKEN_MAX_CHARS);
-  return { spoken: spoken || "I've finished in Chrome.", detail: "" };
+  const answer = typeof (out && out.answer) === "string" ? out.answer.trim() : "";
+  if (answer.length <= SPOKEN_MAX_CHARS) return { spoken: answer || "I've finished in Chrome.", detail: "" };
+  const first = (answer.match(/^.*?[.!?](?=\s|$)/) || [answer])[0].slice(0, SPOKEN_MAX_CHARS);
+  const title = (typeof out.title === "string" && out.title.trim()) || "From Chrome";
+  return { spoken: first, detail: answer, deliver: { notes: { title, body: answer } } };
 }
 
 // ------------------------------------------------------------- the ledger's words
