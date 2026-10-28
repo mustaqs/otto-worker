@@ -205,7 +205,7 @@ console.log("when Anthropic rejects a call (2026-10-28's outage):");
 
   const { endedSentence } = await import("./src/tasks/summary.js");
   check("a checkpoint names the site, and gives the tab back", endedSentence("browser", "failed", "checkpoint", "news.ycombinator.com") === "news.ycombinator.com wants to check you're human — the tab is yours.");
-  check("an extension missing from the profile says which profile", endedSentence("browser", "failed", "extension_missing", "x.com") === "Stopped — Otto's Chrome extension isn't installed or turned on in the Chrome profile you used last.");
+  check("an extension missing from the profile says which profile", endedSentence("browser", "failed", "extension_missing", "x.com") === "Stopped — the Chrome profile Otto uses isn't open, or Otto's extension is off in it.");
 }
 
 // ------------------------------------------------------------------- usage
