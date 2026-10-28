@@ -23,11 +23,15 @@ import {
 // which checkLimits feeds from a KV key — Bench/check-task-path.sh.
 import {
   TYPES, TASK_VERSION, CREATE_KEYS, REQUEST_MAX_CHARS, CONTEXT_MAX_CHARS, DOCUMENT_MAX_BYTES,
+  BROWSER_MODES, URL_MAX_CHARS, BROWSER_MAX_STEPS, SPOKEN_MAX_CHARS,
 } from "./tasks/registry.js";
-import { tasksHeader, TERMINAL } from "./tasks/summary.js";
+import {
+  STEP_KEYS, STEP_KINDS, STEP_BODY_MAX_BYTES, STEP_LABEL_MAX, STEP_SENTENCE_MAX, ledgerText, stepsOf,
+} from "./tasks/browser.js";
+import { tasksHeader, TERMINAL, BROWSER_END_REASONS } from "./tasks/summary.js";
 import {
   insertRow, readRow, deleteRow, markState, finishTask, taskRows, writeSummary,
-  tasksHeaderFor, deleteInstance, terminateInstance,
+  tasksHeaderFor, deleteInstance, terminateInstance, appendStep,
 } from "./tasks/run.js";
 // The feed (A84): the account's tasks as server-sent events, and the one
 // projection the feed and the list share.
@@ -93,6 +97,8 @@ export default {
     if (url.pathname === "/v1/tasks/take") return takeTask(request, env);
     if (url.pathname === "/v1/tasks/delete") return deleteTask(request, env);
     if (url.pathname === "/v1/tasks/feed") return feedTasks(request, env);
+    // A89: the Mac's browser loop records each step it takes.
+    if (url.pathname === "/v1/tasks/step") return stepTask(request, env);
     if (url.pathname === "/v1/tasks") return listTasks(request, env);
 
     if (url.pathname !== "/v1/ask") return problem(404, "not_found");
@@ -1368,6 +1374,21 @@ async function createTask(request, env) {
   // The model's short title (A91), bounded to six words; a create without
   // one is named by its request, cut at a word boundary.
   const title = cleanTitle(body.title) || fallbackTitle(text);
+  // A BROWSER TASK'S MODE AND START PAGE (A89), and for no other type. The
+  // mode is fixed here for good — no route changes the input — and unclear
+  // is read. The page is kept without its query or fragment: the host names
+  // the approval card's source, and a query is no business of the ledger.
+  let browser = null;
+  if (entry.needsUrl) {
+    const mode = body.mode === undefined ? "read" : body.mode;
+    if (!BROWSER_MODES.includes(mode)) return problem(400, "bad_request", { field: "mode" });
+    let start;
+    try { start = new URL(typeof body.url === "string" && body.url.length <= URL_MAX_CHARS ? body.url : ""); } catch { start = null; }
+    if (!start || start.protocol !== "https:" || !start.hostname) return problem(400, "bad_request", { field: "url" });
+    browser = { mode, url: `${start.origin}${start.pathname}`, host: start.hostname };
+  } else if (body.mode !== undefined || body.url !== undefined) {
+    return problem(400, "bad_request", { field: body.mode !== undefined ? "mode" : "url" });
+  }
   const context = typeof body.context === "string" ? body.context.trim().slice(0, CONTEXT_MAX_CHARS) : "";
   const now = typeof body.now === "string" && !Number.isNaN(new Date(body.now).getTime()) ? body.now : null;
   if (!now) return problem(400, "bad_request", { field: "now" });
@@ -1399,7 +1420,7 @@ async function createTask(request, env) {
 
   const id = crypto.randomUUID();
   const createdAt = Date.now();
-  const input = { request: text, title, ...(context ? { context } : {}), ...(document !== undefined ? { document } : {}), now, tz, taskVersion: TASK_VERSION };
+  const input = { request: text, title, ...(browser || {}), ...(context ? { context } : {}), ...(document !== undefined ? { document } : {}), now, tz, taskVersion: TASK_VERSION };
   try {
     await insertRow(env, { id, accountId, type, input, createdAt });
   } catch (error) {
@@ -1423,6 +1444,120 @@ async function createTask(request, env) {
   await writeSummary(env, accountId);
   console.log(`task ${type} created`);
   return json200({ id, state: "created" }, await safeTasksHeader(env, accountId));
+}
+
+/**
+ * POST /v1/tasks/step  { id, n, kind, label?, sentence?, answer?, reason? }  →  200 { id, n, state } + otto-tasks
+ *
+ * A89: the Mac's browser loop records the step it just took. The ledger is
+ * the row; the instance is told only that a step was posted, and reads the
+ * row to act on it (src/tasks/browser.js says why).
+ *
+ * WHAT THE LEDGER MAY HOLD, AND NOTHING ELSE: a label for each step, the
+ * extension's sentence for an approval, the final answer, and a reason word
+ * for an end. The body is an allowlist of seven keys under 2 KB, so page
+ * text has no name to arrive under and no room if it found one; every string
+ * is cleaned of invisible characters and of any URL's query or fragment.
+ *
+ * In order: the bearer must have an account; the task must be the account's
+ * own browser task, not finished; the step must be the next one, at most the
+ * twenty-fifth, inside thirty minutes of working time; an approval only in a
+ * task started to act; then the row, then the event.
+ */
+async function stepTask(request, env) {
+  const auth = await authenticateAccount(request, env);
+  if (auth.refused) return auth.refused;
+  const declared = Number(request.headers.get("content-length"));
+  if (declared > STEP_BODY_MAX_BYTES) return problem(413, "body_too_large");
+  let body;
+  try {
+    const raw = await request.arrayBuffer();
+    if (raw.byteLength > STEP_BODY_MAX_BYTES) return problem(413, "body_too_large");
+    body = JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return problem(400, "malformed_json");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return problem(400, "bad_request");
+  for (const key of Object.keys(body)) if (!STEP_KEYS.includes(key)) return problem(400, "bad_request", { key });
+
+  const id = typeof body.id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(body.id) ? body.id : "";
+  if (!id) return problem(400, "bad_request", { field: "id" });
+  const n = Number.isInteger(body.n) ? body.n : 0;
+  if (n < 1) return problem(400, "bad_request", { field: "n" });
+  const kind = STEP_KINDS.includes(body.kind) ? body.kind : "";
+  if (!kind) return problem(400, "bad_request", { field: "kind" });
+  const label = typeof body.label === "string" ? ledgerText(body.label, STEP_LABEL_MAX) : "";
+  const sentence = typeof body.sentence === "string" ? ledgerText(body.sentence, STEP_SENTENCE_MAX) : "";
+  const answer = typeof body.answer === "string" ? ledgerText(body.answer, SPOKEN_MAX_CHARS) : "";
+  if ((kind === "step" || kind === "approval") && !label) return problem(400, "bad_request", { field: "label" });
+  if (kind === "approval" && !sentence) return problem(400, "bad_request", { field: "sentence" });
+  if (kind === "finish" && !answer) return problem(400, "bad_request", { field: "answer" });
+  if (kind === "end" && !BROWSER_END_REASONS[body.reason]) return problem(400, "bad_request", { field: "reason" });
+
+  const task = { id, accountId: auth.account.subject };
+  let row;
+  try { row = await readRow(env, task); } catch (error) {
+    console.error("task row unreadable:", String(error && error.name || "error"));
+    return problem(503, "not_provisioned");
+  }
+  // ANOTHER ACCOUNT'S TASK IS NOT FOUND: every read names the account.
+  if (!row) return problem(404, "not_found");
+  if (row.type !== "browser") return problem(400, "not_browser");
+  if (TERMINAL.has(row.state)) return problem(409, "already_finished", { state: row.state }, await safeTasksHeader(env, task.accountId));
+
+  // AN END IS ALWAYS TAKEN while the task is alive, even waiting for a yes:
+  // the user closed the tab, Chrome quit, Otto quit. The instance is ended
+  // here, as a cancel is; a stop the user made is seen at once (A82).
+  if (kind === "end") {
+    await terminateInstance(env, task.id);
+    const byUser = body.reason === "user_closed_tab" || body.reason === "user_stopped";
+    await finishTask(env, task, byUser ? "cancelled" : "failed", { reason: body.reason, seen: byUser });
+    console.log(`task browser ended: ${body.reason}`);
+    return json200({ id, n, state: byUser ? "cancelled" : "failed" }, await safeTasksHeader(env, task.accountId));
+  }
+  if (row.state === "awaiting_approval") return problem(409, "awaiting_approval", {}, await safeTasksHeader(env, task.accountId));
+
+  let input = {};
+  try { input = JSON.parse(row.input || "{}"); } catch { input = {}; }
+  // THE MODE NEVER CHANGES (A89 §5): a task started to read cannot ask to act.
+  if (kind === "approval" && input.mode !== "act") return problem(409, "read_only", {}, await safeTasksHeader(env, task.accountId));
+
+  const steps = stepsOf(row);
+  if (n !== steps.length + 1) return problem(409, "out_of_order", { expected: steps.length + 1 }, await safeTasksHeader(env, task.accountId));
+  const elapsed = Date.now() - Number(row.created_at) - (Number(row.waited_ms) || 0);
+  const limit = n > BROWSER_MAX_STEPS ? "step_limit" : elapsed > TYPES.browser.maxDurationMs ? "max_duration" : "";
+  if (limit) {
+    // THE BOUND ENDS THE TASK, not only the step: the loop is told why.
+    await terminateInstance(env, task.id);
+    await finishTask(env, task, "failed", { reason: limit });
+    console.log(`task browser ended: ${limit}`);
+    return problem(409, limit, {}, await safeTasksHeader(env, task.accountId));
+  }
+
+  const entry = {
+    name: `step-${n}`, kind, ended: Date.now(), outcome: "ok",
+    ...(label ? { label } : {}),
+    ...(kind === "approval" ? { ask: sentence } : {}),
+    ...(kind === "finish" ? { answer, label: label || "Done" } : {}),
+  };
+  try {
+    await appendStep(env, task, row, entry);
+  } catch (error) {
+    // Two posts of one step: the ledger moved under this one, so it is late.
+    if (error && error.name === "LedgerConflict") return problem(409, "out_of_order", {}, await safeTasksHeader(env, task.accountId));
+    console.error("task step not written:", String(error && error.name || "error"));
+    return problem(503, "not_provisioned");
+  }
+  try {
+    const instance = await env.TASKS.get(task.id);
+    // NOTHING BUT "A STEP WAS POSTED": the instance reads the row.
+    await instance.sendEvent({ type: "browser-step", payload: { n } });
+  } catch (error) {
+    console.error(`task step not delivered (${error && error.name ? error.name : "error"})`);
+    await finishTask(env, task, "failed", { reason: "step_failed" });
+    return problem(502, "task_failed", {}, await safeTasksHeader(env, task.accountId));
+  }
+  return json200({ id, n, state: row.state }, await safeTasksHeader(env, task.accountId));
 }
 
 /** The row named in the body, for this account, or the refusal. */

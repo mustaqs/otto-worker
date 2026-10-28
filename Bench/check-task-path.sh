@@ -28,6 +28,7 @@ MODEL=src/tasks/model.js
 WF=src/tasks/workflow.js
 REG=src/tasks/registry.js
 RESEARCH=src/tasks/research.js
+BROWSER=src/tasks/browser.js
 SUMMARY=src/tasks/summary.js
 FEED=src/tasks/feed.js
 MAIN=src/main.js
@@ -130,14 +131,21 @@ else
     printf '       calls: %s, inside runTask: %s\n' "$finals" "$in_run"
 fi
 
-# FAILING EDIT: remove `timeout:` from the waitForEvent call, or call waitForEvent in research.js.
-waits=$(cat $RUN $REG $RESEARCH $SUMMARY $MODEL | sed 's|//.*||' | grep -c "waitForEvent(")
+# FAILING EDIT: remove `timeout:` from either waitForEvent call, or call
+# waitForEvent in research.js or browser.js. Two callers since A89: askUser
+# (the approval) and awaitStep (the browser ledger's "a step was posted").
+waits=$(cat $RUN $REG $RESEARCH $BROWSER $SUMMARY $MODEL | sed 's|//.*||' | grep -c "waitForEvent(")
 in_ask=$(body "$RUN" askUser | sed 's|//.*||' | grep "waitForEvent(" | grep -c "timeout:")
-if [ "$waits" = "1" ] && [ "$in_ask" = "1" ]; then
-    check "waitForEvent has one caller, askUser, and it passes a timeout" 0
+in_step=$(body "$RUN" awaitStep | sed 's|//.*||' | grep "waitForEvent(" | grep -c "timeout: entry.idleTimeout")
+if [ "$waits" = "2" ] && [ "$in_ask" = "1" ] && [ "$in_step" = "1" ]; then
+    check "waitForEvent has two callers, askUser and awaitStep, and each passes a timeout" 0
 else
-    check "waitForEvent has one caller, askUser, and it passes a timeout" 1
+    check "waitForEvent has two callers, askUser and awaitStep, and each passes a timeout" 1
 fi
+# FAILING EDIT: throw TaskIdle for every error in awaitStep.
+idle=$(body "$RUN" awaitStep | sed 's|//.*||')
+echo "$idle" | grep -q 'const idle = isTimeout(error);' && echo "$idle" | grep -q 'if (idle) throw Object.assign(new Error("idle"), { name: "TaskIdle" });' && echo "$idle" | grep -q "throw error;"
+check "only the idle wait's timeout becomes expired (idle); any other error is rethrown" $?
 
 # FAILING EDIT: replace `if (isTimeout(error)) throw` with an unconditional throw of TaskExpired.
 ask=$(body "$RUN" askUser | sed 's|//.*||')
@@ -161,7 +169,7 @@ check "the failed ledger entry is written inside guardedStep's catch before the 
 # the ask-write step's output (what the live run of 2026-10-11 did: after the
 # hibernated wait the engine replays run() and a local is the replay's time).
 ask=$(body "$RUN" askUser | sed 's|//.*||')
-echo "$ask" | grep -q 'const asked = await step.do("ask-write"' && echo "$ask" | grep -q 'return { askedAt, until };' \
+echo "$ask" | grep -q 'const asked = await step.do(`ask-write${suffix}`' && echo "$ask" | grep -q 'return { askedAt, until };' \
     && ! echo "$ask" | grep -q '^  const askedAt = Date.now()' && echo "$ask" | grep -q 'waitedMs: Date.now() - asked.askedAt'
 check "the wait's start is the ask-write step's output, so a replay after hibernation keeps it" $?
 
@@ -220,10 +228,15 @@ check "and research does not" $?
 
 # FAILING EDIT: add "image" to CREATE_KEYS, or remove the allowlist loop.
 # Seven since A91 added `title`, which is text, checked as text, and bounded.
-grep -q 'CREATE_KEYS = \["type", "request", "title", "context", "document", "now", "tz"\]' "$REG" \
+# Nine since A89 added a browser task's `mode` and `url`, accepted for that
+# type alone, the mode from a closed set and the url only as https.
+grep -q 'CREATE_KEYS = \["type", "request", "title", "mode", "url", "context", "document", "now", "tz"\]' "$REG" \
     && echo "$create" | grep -q "CREATE_KEYS.includes(key)" \
-    && echo "$create" | grep -q 'typeof body.title !== "string"'
-check "the create body is an allowlist of seven keys, so an image has no name to arrive under" $?
+    && echo "$create" | grep -q 'typeof body.title !== "string"' \
+    && echo "$create" | grep -q 'if (!BROWSER_MODES.includes(mode))' \
+    && echo "$create" | grep -q 'start.protocol !== "https:"' \
+    && echo "$create" | grep -q '} else if (body.mode !== undefined || body.url !== undefined) {'
+check "the create body is an allowlist of nine keys, so an image has no name to arrive under" $?
 
 # FAILING EDIT: drop `seen: true` from cancelTask's finishTask, or the
 # `seen: decision === "decline"` from approveTask's markState. A row the user
@@ -276,8 +289,29 @@ sed 's|//.*||' "$FEED" | grep -q "cancel() { close(); }" && sed 's|//.*||' "$FEE
 check "the stream's cancel and the request's abort both close it" $?
 
 # FAILING EDIT: emit the "start" or "ask-write" step by widening SHOWN.
-grep -q '^export const SHOWN = /\^(plan|draft|search-\\d+)\$/;' "$FEED"
-check "the shown steps are plan, the searches and the draft; bookkeeping steps stay out" $?
+grep -q '^export const SHOWN = /\^(plan|draft|search-\\d+|step-\\d+)\$/;' "$FEED"
+check "the shown steps are plan, the searches, the draft and a browser task's steps; bookkeeping stays out" $?
+
+echo "the browser ledger (A89):"
+step=$(body "$SRC" stepTask)
+# FAILING EDIT: drop the allowlist loop from stepTask, or add "outline" to STEP_KEYS.
+grep -q 'export const STEP_KEYS = \["id", "n", "kind", "label", "sentence", "answer", "reason"\];' "$BROWSER" \
+    && echo "$step" | grep -q 'if (!STEP_KEYS.includes(key)) return problem(400, "bad_request", { key });' \
+    && echo "$step" | grep -q 'raw.byteLength > STEP_BODY_MAX_BYTES'
+check "a step is an allowlist of seven keys under 2 KB: page text has no key and no room" $?
+# FAILING EDIT: store body.label as it came, without ledgerText.
+[ "$(echo "$step" | sed 's|//.*||' | grep -c 'ledgerText(body\.')" = "3" ]
+check "every string a step brings is cleaned of invisible characters and URL queries" $?
+# FAILING EDIT: send the step's label in the event's payload.
+echo "$step" | grep -q 'await instance.sendEvent({ type: "browser-step", payload: { n } });'
+check "the instance is told only that a step was posted, never what it said" $?
+# FAILING EDIT: let a step update the task's input.
+! echo "$step" | sed 's|//.*||' | grep -qE 'input:|"input"|SET input'
+check "no step writes the task's input: the mode can never change" $?
+echo "$step" | grep -q 'if (kind === "approval" && input.mode !== "act") return problem(409, "read_only"'
+check "an approval only in a task started to act" $?
+echo "$step" | grep -q 'n > BROWSER_MAX_STEPS ? "step_limit" : elapsed > TYPES.browser.maxDurationMs ? "max_duration"'
+check "the step bound and the working-time bound end the task from the route" $?
 
 # FAILING EDIT: have guardedStep spread the whole `out` into the ledger entry.
 guarded=$(body "$RUN" guardedStep | sed 's|//.*||')

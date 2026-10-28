@@ -29,7 +29,7 @@ export const PING_MS = 15_000;
 /** Every second ping, the rows are re-read to notice a task started elsewhere. */
 export const REREAD_EVERY = 2;
 /** The steps a user sees. start, ask-write, ask-read, finish and finish-failed are bookkeeping. */
-export const SHOWN = /^(plan|draft|search-\d+)$/;
+export const SHOWN = /^(plan|draft|search-\d+|step-\d+)$/;
 
 const parse = (json) => { try { return json ? JSON.parse(json) : null; } catch { return null; } };
 const cut = (value, max) => (typeof value === "string" ? value.slice(0, max) : "");
@@ -78,6 +78,10 @@ export function projectRow(row) {
     ...(row.finished_at ? { finishedAt: Number(row.finished_at) } : {}),
     seen: row.seen_at != null,
     subject: cut(input.request, SUBJECT_MAX),
+    // A browser task's mode and the site it started on (A89): the approval
+    // card's source line is "Chrome · <host>" (A90).
+    ...(row.type === "browser" && typeof input.host === "string" ? { site: cut(input.host, 253) } : {}),
+    ...(row.type === "browser" && typeof input.mode === "string" ? { mode: input.mode } : {}),
     // The name the task goes by everywhere (A91); the request cut at a word
     // boundary for a task created before titles.
     title: titleOf(input),

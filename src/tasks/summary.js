@@ -21,12 +21,34 @@ const MAX_SENTENCE = 240;
 
 /** A fixed sentence for a task that did not end with a result. The reason word, never the request. */
 export function endedSentence(type, state, reason) {
+  if (type === "browser") return browserEnded(state, reason);
   const name = type === "research" ? "The research" : "The task";
   if (state === "cancelled" && reason === "declined") return `${name} stopped because you said no.`;
   if (state === "cancelled") return `${name} was cancelled.`;
   if (state === "expired") return `${name} waited too long for an answer and stopped.`;
   if (reason === "max_duration") return `${name} ran out of time.`;
   return `${name} failed partway.`;
+}
+
+/** A89: a browser task ends for reasons of its own, each said as what happened. */
+export const BROWSER_END_REASONS = {
+  user_closed_tab: "Stopped — you closed Otto's tab.",
+  user_stopped: "Stopped — you pressed stop.",
+  browser_closed: "Stopped — Chrome was closed.",
+  otto_quit: "Stopped — Otto quit.",
+  checkpoint: "Stopped — the site wants to check you're human, and that's yours to do.",
+  extension_missing: "Stopped — Otto's Chrome extension isn't installed or turned on.",
+  gave_up: "Stopped — I couldn't do that on this site.",
+};
+function browserEnded(state, reason) {
+  if (BROWSER_END_REASONS[reason]) return BROWSER_END_REASONS[reason];
+  if (state === "expired" && reason === "idle") return "Your Mac went to sleep or Otto quit, so I stopped.";
+  if (state === "cancelled" && reason === "declined") return "Stopped — you said no.";
+  if (state === "cancelled") return "The browser task was cancelled.";
+  if (state === "expired") return "The browser task waited too long for an answer and stopped.";
+  if (reason === "max_duration") return "Stopped — that took more than thirty minutes.";
+  if (reason === "step_limit") return "Stopped — that took more than twenty-five steps.";
+  return "The browser task failed partway.";
 }
 
 /**

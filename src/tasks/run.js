@@ -52,7 +52,11 @@ export async function runTask({ event, step, env, NonRetryableError }) {
     task,
     entry,
     step: (name, fn, config) => guardedStep({ step, env, task, NonRetryableError }, name, fn, config),
-    ask: (spoken) => askUser({ step, env, task, entry }, spoken),
+    ask: (spoken, key) => askUser({ step, env, task, entry }, spoken, key),
+    // A89: the browser ledger's wait for "a step was posted", and the row it
+    // then reads — only ever from inside a step, so a replay reads the cache.
+    awaitStep: (i) => awaitStep({ step, env, task, entry }, i),
+    row: () => readRow(env, task),
     model: async (request) => {
       try {
         return await anthropic(env, entry.model, request);
@@ -73,8 +77,10 @@ export async function runTask({ event, step, env, NonRetryableError }) {
     const reason = /\bmax_duration\b/.test(message) ? "max_duration"
       : error && error.name === "TaskDeclined" ? "declined"
       : error && error.name === "TaskExpired" ? "timeout"
+      : error && error.name === "TaskIdle" ? "idle"
+      : error && error.name === "TaskStepLimit" ? "step_limit"
       : "step_failed";
-    const state = reason === "declined" ? "cancelled" : reason === "timeout" ? "expired" : "failed";
+    const state = reason === "declined" ? "cancelled" : reason === "timeout" || reason === "idle" ? "expired" : "failed";
     // The reason word, never the words. The failed step named itself in the
     // ledger and the log before it threw (guardedStep, askUser): a property
     // set on the error inside step.do does not survive the engine's rethrow,
@@ -114,6 +120,8 @@ function guardedStep({ step, env, task, NonRetryableError }, name, fn, config = 
     // BEST-EFFORT. The work is done; the ledger must not undo it. The label
     // and the plan's queries are the only words a step hands the ledger
     // (A84): the tab names steps from them, the feed never reads an output.
+    // A bookkeeping step (the browser ledger's reads, A89) writes no entry.
+    if (config.record === false) return out;
     await recordStep(env, task, {
       name, started, ended: Date.now(), outcome: "ok",
       ...(out && out.cost ? out.cost : {}),
@@ -134,13 +142,16 @@ function finalStep(step, name, fn) {
  * approval timeout, records how long it waited so the clock forgives it, and
  * maps only the timeout to `expired`.
  */
-async function askUser({ step, env, task, entry }, spoken) {
+async function askUser({ step, env, task, entry }, spoken, key) {
+  // ONE SET OF STEP NAMES PER QUESTION. Research asks at most once and keeps
+  // its names; a browser task may ask before each act, keyed by its step (A89).
+  const suffix = key ? `-${key}` : "";
   // THE WAIT'S START IS A STEP'S OUTPUT, never a local. After a hibernated
   // wait the engine replays run() from the top and only step outputs survive:
   // a `Date.now()` taken here would be the replay's time, the wait would be
   // recorded as milliseconds, and the clock would not forgive it — the live
   // run of 2026-10-11 recorded waited_ms 64 for a 34-minute wait and ran out.
-  const asked = await step.do("ask-write", { timeout: "1 minute" }, async () => {
+  const asked = await step.do(`ask-write${suffix}`, { timeout: "1 minute" }, async () => {
     const askedAt = Date.now();
     const until = askedAt + durationMs(entry.approvalTimeout);
     await markState(env, task, "awaiting_approval", { question: { spoken: String(spoken || "").slice(0, 240), askedAt, until } });
@@ -148,20 +159,37 @@ async function askUser({ step, env, task, entry }, spoken) {
   });
   let event;
   try {
-    event = await step.waitForEvent("ask-wait", { type: "approval", timeout: `${asked.until - asked.askedAt} ms` });
+    event = await step.waitForEvent(`ask-wait${suffix}`, { type: "approval", timeout: `${asked.until - asked.askedAt} ms` });
   } catch (error) {
     const expired = isTimeout(error);
     const word = expired ? "TaskExpired" : errorWord(error);
     console.error(`task ${task.type} step ask-wait failed: ${word}`);
-    await recordStep(env, task, { name: "ask-wait", started: asked.askedAt, ended: Date.now(), outcome: "failed", error: word });
+    await recordStep(env, task, { name: `ask-wait${suffix}`, started: asked.askedAt, ended: Date.now(), outcome: "failed", error: word });
     if (expired) throw Object.assign(new Error("timeout"), { name: "TaskExpired" });
     throw error;
   }
   const decision = event && event.payload && event.payload.decision === "approve" ? "approve" : "decline";
-  await step.do("ask-read", { timeout: "1 minute" }, () =>
+  await step.do(`ask-read${suffix}`, { timeout: "1 minute" }, () =>
     markState(env, task, decision === "approve" ? "running" : "declined", { waitedMs: Date.now() - asked.askedAt }));
   if (decision === "decline") throw Object.assign(new Error("declined"), { name: "TaskDeclined" });
   return decision;
+}
+
+/**
+ * THE OTHER CALLER OF waitForEvent (A89): the browser ledger's wait for "a
+ * step was posted", with the type's idle limit as its timeout. Only that
+ * timeout becomes `expired` (reason `idle`): "Your Mac went to sleep or Otto
+ * quit, so I stopped." Any other error is a failed step.
+ */
+async function awaitStep({ step, env, task, entry }, i) {
+  try {
+    return await step.waitForEvent(`step-wait-${i}`, { type: "browser-step", timeout: entry.idleTimeout });
+  } catch (error) {
+    const idle = isTimeout(error);
+    console.error(`task ${task.type} step step-wait-${i} failed: ${idle ? "TaskIdle" : errorWord(error)}`);
+    if (idle) throw Object.assign(new Error("idle"), { name: "TaskIdle" });
+    throw error;
+  }
 }
 
 /**
@@ -243,19 +271,50 @@ export async function markState(env, task, state, { question, answer, waitedMs, 
 /**
  * One ledger entry per step name; a retry replaces its own entry. BEST-EFFORT:
  * logged by class, never thrown.
+ *
+ * COMPARE-AND-SET, since A89 gave the ledger a second writer: the step route
+ * appends while the Workflow records its own steps, and a plain
+ * read-modify-write would drop whichever wrote first. The write lands only
+ * if the list is still what was read; a lost race reads again, three times.
  */
 export async function recordStep(env, task, entry) {
   try {
-    const row = await readRow(env, task);
-    let steps = [];
-    try { steps = JSON.parse((row && row.steps) || "[]"); } catch { steps = []; }
-    if (!Array.isArray(steps)) steps = [];
-    const index = steps.findIndex((s) => s && s.name === entry.name);
-    if (index >= 0) steps[index] = entry; else steps.push(entry);
-    await updateRow(env, task, { steps: JSON.stringify(steps) });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const row = await readRow(env, task);
+      const steps = parseSteps(row);
+      const index = steps.findIndex((s) => s && s.name === entry.name);
+      if (index >= 0) steps[index] = entry; else steps.push(entry);
+      if (await casSteps(env, task, row, steps)) return;
+    }
+    console.error(`task ledger not written for ${entry.name} (LedgerConflict)`);
   } catch (error) {
     console.error(`task ledger not written for ${entry.name} (${error && error.name ? error.name : "error"})`);
   }
+}
+
+/**
+ * The step route's append (A89): THROWS, unlike recordStep — a step the Mac
+ * posted and the relay did not keep must be answered as an error, and a lost
+ * race (the same step posted twice) as LedgerConflict.
+ */
+export async function appendStep(env, task, row, entry) {
+  const steps = parseSteps(row);
+  steps.push(entry);
+  if (!(await casSteps(env, task, row, steps))) throw Object.assign(new Error("ledger moved"), { name: "LedgerConflict" });
+}
+
+function parseSteps(row) {
+  let steps = [];
+  try { steps = JSON.parse((row && row.steps) || "[]"); } catch { steps = []; }
+  return Array.isArray(steps) ? steps : [];
+}
+
+/** `UPDATE … WHERE id = ? AND account_id = ? AND steps = ?`: true when it landed. */
+async function casSteps(env, task, row, steps) {
+  const result = await env.DB.prepare(
+    `UPDATE tasks SET steps = ?, updated_at = ? WHERE id = ? AND account_id = ? AND steps = ?`
+  ).bind(JSON.stringify(steps), Date.now(), task.id, task.accountId, (row && row.steps) || "[]").run();
+  return !(result && result.meta && Number(result.meta.changes) === 0);
 }
 
 export async function finishTask(env, task, state, { result, reason, seen } = {}) {

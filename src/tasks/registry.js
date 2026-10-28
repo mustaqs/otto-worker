@@ -10,6 +10,10 @@
  * test.mjs — and, in the app, one enum value, two lines and a pin (A83).
  */
 import { runResearch, renderResearch } from "./research.js";
+import { runBrowser, renderBrowser } from "./browser.js";
+
+/** Steps the Mac may post in one browser task (A89): the step route refuses the 26th. */
+export const BROWSER_MAX_STEPS = 25;
 
 /** Rides in every instance's params, so a later reader of a row can tell which code ran it. */
 export const TASK_VERSION = 1;
@@ -23,7 +27,11 @@ export const PRICES = {
 
 /** The body keys /v1/tasks/create accepts. An allowlist, so an image can never arrive under a name of its own (A60). */
 // `title` (A91): the model's short name for the task, at most six words.
-export const CREATE_KEYS = ["type", "request", "title", "context", "document", "now", "tz"];
+// `mode` and `url` (A89): a browser task's read-or-act, fixed here for good, and its start page.
+export const CREATE_KEYS = ["type", "request", "title", "mode", "url", "context", "document", "now", "tz"];
+/** A browser task's two modes (A89 §5). Unclear is read; it can never change after create. */
+export const BROWSER_MODES = ["read", "act"];
+export const URL_MAX_CHARS = 2048;
 export const REQUEST_MAX_CHARS = 4000;
 export const CONTEXT_MAX_CHARS = 300;
 export const DOCUMENT_MAX_BYTES = 32768;
@@ -46,6 +54,26 @@ export const TYPES = {
     retention: "3 days",
     run: runResearch,
     render: renderResearch,
+  },
+  // A89: the work runs on the Mac; this entry is the ledger and the hold.
+  browser: {
+    tool: {
+      name: "browser",
+      description: "Do something on a website in the user's own Chrome: read a page, or fill something in and ask before submitting.",
+    },
+    needsDocument: false,
+    needsUrl: true,
+    // The Mac's loop waits on the answer with the window open, so the hold
+    // is as long as the idle limit, not a research task's day.
+    approvalTimeout: "10 minutes",
+    idleTimeout: "10 minutes",
+    maxDurationMs: 30 * 60 * 1000,
+    maxSteps: BROWSER_MAX_STEPS,
+    costClass: "mac",        // the model calls are the Mac's, through the relay; this entry calls no model
+    model: null,
+    retention: "3 days",
+    run: runBrowser,
+    render: renderBrowser,
   },
 };
 

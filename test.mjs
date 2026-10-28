@@ -1058,8 +1058,10 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
                 else { failures.stepsWrites--; throw Object.assign(new Error("d1 unavailable"), { name: "D1Error" }); }
               }
               const row = tasks.find((t) => t.id === args[cols.length] && t.account_id === args[cols.length + 1]);
+              // A89's compare-and-set: `… AND steps = ?` lands only if the list is unchanged.
+              if (row && q.includes("AND steps = ?") && row.steps !== args[cols.length + 2]) return { meta: { changes: 0 } };
               if (row) cols.forEach((c, i) => { row[c] = args[i]; });
-              return;
+              return { meta: { changes: row ? 1 : 0 } };
             }
             if (q.startsWith("DELETE FROM tasks")) {
               const i = tasks.findIndex((t) => t.id === args[0] && t.account_id === args[1]);
@@ -1813,6 +1815,172 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
           listed && listed.subject === "Lisbon coworking day passes" && listed.steps.length === 2 && listed.steps[1].label === "lisbon coworking day pass"
           && !JSON.stringify(list).includes(SECRET) && !JSON.stringify(list).includes("detail"), JSON.stringify(listed));
     Date.now = realNowFeed;
+  }
+
+
+  // --- browser tasks (A89): create, the step route, the ledger
+  {
+    const { stepsOf, ledgerText } = await import("./src/tasks/browser.js");
+    const zw = String.fromCharCode(0x200b), rlo = String.fromCharCode(0x202e), bom = String.fromCharCode(0xfeff);
+    const PAGE = "PAGETEXT-NEVER-STORED", QUERY = "QUERYSECRET";
+    const browserBody = { type: "browser", request: "Find my most recent Amazon order", title: "My latest Amazon order",
+                          url: `https://www.amazon.com/gp/css/order-history?ref_=nav&token=${QUERY}#top`, now: "2026-10-28T09:00:00Z", tz: "UTC" };
+    const create = async (extra = {}) => { clearCounter(); const r = await post("/v1/tasks/create", deviceToken, { ...browserBody, ...extra }); return { r, j: await r.json() }; };
+    const stepPost = (token, body) => post("/v1/tasks/step", token, body);
+    const rowOf = (id) => db.tasks.find((t) => t.id === id);
+
+    // create
+    const { r: c1, j: j1 } = await create();
+    const in1 = JSON.parse(rowOf(j1.id).input);
+    check("a browser task is created through the existing create route", c1.status === 200 && rowOf(j1.id).type === "browser");
+    check("with no mode it is a read (A89: unclear is read)", in1.mode === "read");
+    check("its start page is kept without query or fragment, with its host",
+          in1.url === "https://www.amazon.com/gp/css/order-history" && in1.host === "www.amazon.com" && !rowOf(j1.id).input.includes(QUERY), JSON.stringify(in1));
+    check("a mode other than read or act is refused", (await create({ mode: "drive" })).r.status === 400);
+    check("a browser task needs an https start page",
+          (await create({ url: "http://www.amazon.com/" })).r.status === 400 && (await create({ url: "javascript:alert(1)" })).r.status === 400
+          && (await create({ url: undefined })).r.status === 400);
+    clearCounter();
+    check("mode and url belong to browser tasks only",
+          (await post("/v1/tasks/create", deviceToken, { ...goodBody, mode: "act" })).status === 400
+          && (await post("/v1/tasks/create", deviceToken, { ...goodBody, url: "https://a.example/" })).status === 400);
+    const readId = j1.id;
+    const { j: jAct } = await create({ mode: "act", url: "https://httpbin.org/forms/post", title: "Pizza order" });
+    const actId = jAct.id;
+    const list = await (await post("/v1/tasks", deviceToken, {})).json();
+    const listed = list.tasks.find((t) => t.id === actId);
+    check("the projection carries the site and the mode, for the approval card's \"Chrome · <host>\"",
+          listed && listed.site === "httpbin.org" && listed.mode === "act" && listed.title === "Pizza order");
+
+    // the step route
+    const eventsBefore = tasks.log.length;
+    const s1 = await stepPost(deviceToken, { id: readId, n: 1, kind: "step",
+      label: `Opened${zw} https://www.amazon.com/gp/css/order-history?token=${QUERY}#x${bom}` });
+    const e1 = stepsOf(rowOf(readId))[0];
+    check("a step is recorded with its label cleaned: no query, no fragment, no invisible characters",
+          s1.status === 200 && e1 && e1.name === "step-1" && e1.label === "Opened https://www.amazon.com/gp/css/order-history", JSON.stringify(e1));
+    const sent = tasks.log.slice(eventsBefore).filter((l) => l.call === "sendEvent");
+    check("the instance is told only that a step was posted", sent.length === 1 && sent[0].event.type === "browser-step"
+          && JSON.stringify(sent[0].event.payload) === JSON.stringify({ n: 1 }));
+    check("a step for another account's task is not found", (await stepPost(otherToken, { id: readId, n: 2, kind: "step", label: "x" })).status === 404);
+    check("a trial device cannot post a step", (await stepPost(trialToken, { id: readId, n: 2, kind: "step", label: "x" })).status === 403);
+    const skip = await stepPost(deviceToken, { id: readId, n: 3, kind: "step", label: "x" });
+    check("a step out of order is refused, and says which comes next", skip.status === 409 && (await skip.json()).expected === 2);
+    check("the same step twice is refused", (await stepPost(deviceToken, { id: readId, n: 1, kind: "step", label: "again" })).status === 409);
+    const beforeSteps = rowOf(readId).steps;
+    const smuggled = await stepPost(deviceToken, { id: readId, n: 2, kind: "step", label: "Read the page", outline: `${PAGE} the whole page` });
+    check("page content has no key to arrive under: an unknown key is refused and nothing is written",
+          smuggled.status === 400 && (await smuggled.json()).key === "outline" && rowOf(readId).steps === beforeSteps);
+    const big = await stepPost(deviceToken, { id: readId, n: 2, kind: "step", label: PAGE.repeat(150) });
+    check("and no room if it found one: a body over 2 KB is refused", big.status === 413 && rowOf(readId).steps === beforeSteps);
+    check("the mode cannot be changed by a step", (await stepPost(deviceToken, { id: readId, n: 2, kind: "step", label: "x", mode: "act" })).status === 400
+          && JSON.parse(rowOf(readId).input).mode === "read");
+    const ro = await stepPost(deviceToken, { id: readId, n: 2, kind: "approval", label: "Submit", sentence: "On amazon.com: buy it. Go ahead?" });
+    check("a task started to read cannot ask to act", ro.status === 409 && (await ro.json()).error === "read_only");
+    const researchRow = db.tasks.find((t) => t.type === "research");
+    check("a research task takes no steps", researchRow && (await stepPost(deviceToken, { id: researchRow.id, n: 1, kind: "step", label: "x" })).status === 400);
+    check("a label is required, and a finish needs its answer",
+          (await stepPost(deviceToken, { id: readId, n: 2, kind: "step" })).status === 400
+          && (await stepPost(deviceToken, { id: readId, n: 2, kind: "finish" })).status === 400);
+
+    // the race: two writers of one ledger
+    const raceRow = rowOf(readId);
+    const staleSteps = raceRow.steps;
+    raceRow.steps = JSON.stringify([...JSON.parse(staleSteps), { name: "start", outcome: "ok" }]);
+    const { appendStep } = await import("./src/tasks/run.js");
+    let conflict = null;
+    try { await appendStep(envTasks, { id: readId, accountId }, { ...raceRow, steps: staleSteps }, { name: "step-2", kind: "step", label: "late" }); } catch (e) { conflict = e; }
+    check("a step written against a ledger that moved is refused, not lost or doubled",
+          conflict && conflict.name === "LedgerConflict" && !rowOf(readId).steps.includes("late"));
+
+    // the ledger run: a read task to its answer
+    await stepPost(deviceToken, { id: readId, n: 2, kind: "step", label: "Clicked Returns & Orders" });
+    await stepPost(deviceToken, { id: readId, n: 3, kind: "finish", answer: `Your last order${zw} was a USB-C cable, delivered Tuesday.` });
+    const readStep = makeStep([{ payload: { n: 1 } }, { payload: { n: 2 } }, { payload: { n: 3 } }]);
+    await runWorkflow(readId, readStep);
+    const done = rowOf(readId);
+    check("the ledger run ends the task with the Mac's answer, cleaned", done.state === "succeeded"
+          && JSON.parse(done.result).spoken === "Your last order was a USB-C cable, delivered Tuesday.", done.result);
+    check("its ledger holds the labels and the answer, and no bookkeeping reads",
+          stepsOf(done).map((s) => s.label).join("|") === "Opened https://www.amazon.com/gp/css/order-history|Clicked Returns & Orders|Done"
+          && !done.steps.includes("read-"), done.steps);
+    check("the ledger never stored page text or a query", !done.steps.includes(PAGE) && !done.steps.includes(QUERY) && !done.input.includes(QUERY));
+    check("a finished task refuses steps", (await stepPost(deviceToken, { id: readId, n: 4, kind: "step", label: "x" })).status === 409);
+
+    // an act task: the hold, through askUser, with the extension's sentence
+    const sentence = `On httpbin.org: submit the form (custname = "Ada", size = "medium") to https://httpbin.org/post?debug=${QUERY}. Go ahead?`;
+    await stepPost(deviceToken, { id: actId, n: 1, kind: "step", label: "Filled in the form" });
+    await stepPost(deviceToken, { id: actId, n: 2, kind: "approval", label: "Submit order", sentence });
+    let held = null, refusedWhileHeld = 0;
+    // IN THE ORDER THE RUN CONSUMES THEM. Both steps are posted before the
+    // run starts, so its first read already sees the approval and asks; the
+    // engine routes by type ("approval" vs "browser-step"), this stand-in by
+    // position, so the approval comes second here and step 2's event after it.
+    const actStep = makeStep([
+      { payload: { n: 1 } },
+      { payload: { decision: "approve" }, before: async () => {
+          held = { ...rowOf(actId) };
+          refusedWhileHeld = (await stepPost(deviceToken, { id: actId, n: 3, kind: "step", label: "x" })).status;
+          await post("/v1/tasks/approve", deviceToken, { id: actId, decision: "approve" });
+          await stepPost(deviceToken, { id: actId, n: 3, kind: "finish", answer: "Submitted; the site echoed the order." });
+        } },
+      { payload: { n: 2 } },
+      { payload: { n: 3 } },
+    ]);
+    await runWorkflow(actId, actStep);
+    const heldQ = held && held.question ? JSON.parse(held.question) : {};
+    check("an approval is held through askUser: the row waits, with the extension's sentence (query stripped)",
+          held && held.state === "awaiting_approval"
+          && heldQ.spoken === `On httpbin.org: submit the form (custname = "Ada", size = "medium") to https://httpbin.org/post. Go ahead?`, held && held.question);
+    check("the hold waits ten minutes, not a research task's day", heldQ.until - heldQ.askedAt === 10 * MIN);
+    check("a step posted while the yes is awaited is refused", refusedWhileHeld === 409);
+    check("each approval has its own steps, keyed by the step it holds",
+          actStep.calls.some((c) => c.name === "ask-write-step-2") && actStep.calls.some((c) => c.name === "ask-wait-step-2" && c.wait));
+    check("after the yes the task runs on to its answer", rowOf(actId).state === "succeeded");
+
+    // ten minutes without a step
+    const { j: jIdle } = await create();
+    await runWorkflow(jIdle.id, makeStep([]));
+    const idle = rowOf(jIdle.id);
+    check("ten minutes without a step ends the task expired, reason idle", idle.state === "expired" && idle.reason === "idle");
+    check("and it is said as \"Your Mac went to sleep or Otto quit, so I stopped.\"",
+          endedSentence("browser", "expired", "idle") === "Your Mac went to sleep or Otto quit, so I stopped.");
+    const idleWait = makeStep([]);
+    check("the idle wait is ten minutes, on its own event type", (await runWorkflow((await create()).j.id, idleWait), idleWait.calls.some((c) => c.name === "step-wait-1" && c.config.type === "browser-step" && c.config.timeout === "10 minutes")));
+    check("an expired task refuses steps", (await stepPost(deviceToken, { id: jIdle.id, n: 1, kind: "step", label: "x" })).status === 409);
+
+    // the bounds: twenty-five steps, thirty minutes
+    const { j: jMany } = await create();
+    let lastOk = 0;
+    for (let n = 1; n <= 25; n++) if ((await stepPost(deviceToken, { id: jMany.id, n, kind: "step", label: `Step ${n}` })).status === 200) lastOk = n;
+    const over = await stepPost(deviceToken, { id: jMany.id, n: 26, kind: "step", label: "one too many" });
+    check("twenty-five steps are taken; the twenty-sixth ends the task", lastOk === 25 && over.status === 409
+          && rowOf(jMany.id).state === "failed" && rowOf(jMany.id).reason === "step_limit"
+          && tasks.log.some((l) => l.id === jMany.id && l.call === "terminate"));
+    const { j: jSlow } = await create();
+    rowOf(jSlow.id).created_at = clock - 31 * MIN;
+    const late = await stepPost(deviceToken, { id: jSlow.id, n: 1, kind: "step", label: "x" });
+    check("past thirty minutes of working time a step ends the task", late.status === 409 && rowOf(jSlow.id).reason === "max_duration");
+    const { j: jWaited } = await create();
+    rowOf(jWaited.id).created_at = clock - 31 * MIN;
+    rowOf(jWaited.id).waited_ms = 5 * MIN;
+    check("time spent waiting for a yes is forgiven", (await stepPost(deviceToken, { id: jWaited.id, n: 1, kind: "step", label: "x" })).status === 200);
+
+    // an end from the Mac
+    const { j: jEnd } = await create();
+    check("an end needs a known reason", (await stepPost(deviceToken, { id: jEnd.id, n: 1, kind: "end", reason: "bored" })).status === 400);
+    const ended = await stepPost(deviceToken, { id: jEnd.id, n: 1, kind: "end", reason: "user_closed_tab" });
+    check("closing Otto's tab cancels the task, seen at once, and ends the instance", ended.status === 200
+          && rowOf(jEnd.id).state === "cancelled" && rowOf(jEnd.id).reason === "user_closed_tab" && rowOf(jEnd.id).seen_at
+          && tasks.log.some((l) => l.id === jEnd.id && l.call === "terminate"));
+    check("and is said as what happened", endedSentence("browser", "cancelled", "user_closed_tab") === "Stopped — you closed Otto's tab.");
+    const { j: jGone } = await create();
+    await stepPost(deviceToken, { id: jGone.id, n: 1, kind: "end", reason: "browser_closed" });
+    check("Chrome closing fails the task with its reason, not seen", rowOf(jGone.id).state === "failed" && !rowOf(jGone.id).seen_at
+          && endedSentence("browser", "failed", "browser_closed") === "Stopped — Chrome was closed.");
+    check("ledgerText strips a right-to-left override too", ledgerText(`a${rlo}b`, 10) === "ab");
+    check("nothing of a page or a query reached the log", !logged.join("|").includes(PAGE) && !logged.join("|").includes(QUERY));
+    clearCounter();
   }
 
   // --- the header grammar and the summary
