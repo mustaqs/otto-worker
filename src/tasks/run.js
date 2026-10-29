@@ -282,7 +282,6 @@ export async function markState(env, task, state, { question, answer, waitedMs, 
     fields.waited_ms = (Number(row && row.waited_ms) || 0) + Math.max(0, Math.round(waitedMs));
   }
   await updateRow(env, task, fields);
-  await writeSummary(env, task.accountId);
 }
 
 /**
@@ -347,7 +346,6 @@ export async function finishTask(env, task, state, { result, reason, seen } = {}
   // then failed to reach the terminated instance and wrote "failed" over
   // the user's own cancel. Whatever finishes a row first is what it says.
   await updateRow(env, task, fields, { unlessFinished: true });
-  await writeSummary(env, task.accountId);
 }
 
 /**
@@ -373,14 +371,22 @@ export async function taskRows(env, accountId, now = Date.now()) {
   return kept;
 }
 
-/** The KV copy of the account's task state, rewritten whole. */
-export async function writeSummary(env, accountId) {
-  const rows = await taskRows(env, accountId);
-  const summary = summaryFromRows(rows);
-  // A failed write is logged, never thrown (2026-10-29): the summary is a copy of D1.
-  try { await env.OTTO.put(`tasks:${accountId}`, JSON.stringify(summary)); }
-  catch (error) { console.error(`kv write failed (task summary): ${error && error.name ? error.name : "error"}`); }
-  return summary;
+/**
+ * The question path's read of the account's tasks (2026-10-29: from D1,
+ * where it was a KV copy rewritten on every change). A STATEMENT, so the
+ * question batches it with its counters in one round trip. Only what
+ * summaryFromRows needs: the rows a summary can list — not a seen ending,
+ * not a row past its retention, which this READ leaves out and never
+ * deletes — and of the result and input, the sentence and the host alone,
+ * never the detail or the request.
+ */
+export function summaryQuery(env, accountId, now = Date.now()) {
+  return env.DB.prepare(
+    `SELECT id, type, state, question, reason, seen_at, updated_at,
+            json_extract(result, '$.spoken') AS spoken, json_extract(input, '$.host') AS host
+     FROM tasks WHERE account_id = ? AND (expires_at IS NULL OR expires_at >= ?)
+     AND NOT (seen_at IS NOT NULL AND state IN ('succeeded', 'failed', 'cancelled', 'expired'))`
+  ).bind(accountId, now);
 }
 
 /** The header for a reply that already touched D1: exact, from the rows. */
@@ -393,9 +399,9 @@ export async function tasksHeaderFor(env, accountId) {
 
 /** Best effort: an instance already gone, or already finished, is not an error the user sees. */
 /**
- * THE DAILY CLEANUP (2026-10-29): every account's finished task past its three
+ * THE HOURLY CLEANUP (2026-10-29): every account's finished task past its three
  * days is deleted, with its Workflow instance — by Cloudflare's cron trigger
- * once a day, so a record is gone three days after its task ends whether or
+ * every hour, so a record is gone within an hour of its three days whether or
  * not the account ever reads its tasks again. The read-time sweep in
  * taskRows() stays: between runs, an expired row is never returned.
  */

@@ -5,8 +5,9 @@
 # Four claims, each verified by grep because reading is what lets them drift:
 #   1. The key has exactly two readers: the question path's pass-through in
 #      src/index.js and anthropic() in src/tasks/model.js. No third.
-#   2. The question path reads the task summary and never writes it, never
-#      names the Workflow binding, and never touches D1 for a task.
+#   2. The question path reads the task rows (from D1, since 2026-10-29)
+#      with one SELECT, never writes them and never names the Workflow
+#      binding.
 #   3. Every unit of task work goes through guardedStep, which carries the
 #      max-duration comparison; the wait has one caller and a timeout; the
 #      platform is imported in one file.
@@ -87,19 +88,30 @@ for fn in loadAccount checkLimits validate; do
     esac
 done
 
-# FAILING EDIT: add `env.OTTO.put(tasksKey, "x")` to checkLimits's commit.
-puts=$(body "$SRC" checkLimits | sed 's|//.*||' | grep "put(" | grep -c "tasksKey")
-[ "$puts" = "0" ]
-check "checkLimits reads the task summary and never writes it" $?
-
-# FAILING EDIT: write a second `tasks:` template literal anywhere in index.js.
-literals=$(strip "$SRC" | grep -c '`tasks:')
-inside=$(body "$SRC" counterKeys | sed 's|//.*||' | grep -c '`tasks:')
-if [ "$literals" = "1" ] && [ "$inside" = "1" ]; then
-    check "the one tasks: key literal in index.js is in counterKeys" 0
+# SINCE 2026-10-29 THE QUESTION READS THE ROWS: summaryQuery, one SELECT in
+# checkLimits's batch. It writes nothing and deletes nothing — an expired row
+# is left out, never swept, on the path every question takes.
+# FAILING EDIT: change summaryQuery's SELECT to `DELETE FROM tasks WHERE …`.
+query=$(body "$RUN" summaryQuery | sed 's|//.*||')
+if [ -n "$query" ] && echo "$query" | grep -q 'SELECT id, type, state' \
+   && ! echo "$query" | grep -qE 'INSERT|UPDATE|DELETE|env\.OTTO'; then
+    check "the question's task read is one SELECT, and writes nothing" 0
 else
-    check "the one tasks: key literal in index.js is in counterKeys" 1
+    check "the question's task read is one SELECT, and writes nothing" 1
 fi
+# FAILING EDIT: add `json_extract(result, '$.detail')` (or `result,`) to summaryQuery's columns.
+cols=$(echo "$query" | tr '\n' ' ' | sed 's/.*SELECT \(.*\) FROM tasks.*/\1/')
+plain=$(echo "$cols" | sed "s/json_extract(result, '\$\.spoken')//; s/json_extract(input, '\$\.host')//")
+case "$plain" in
+    *detail*|*result*|*input*|*"*"*) check "it reads the sentence and host, never the detail or the request" 1 ;;
+    *)                               check "it reads the sentence and host, never the detail or the request" 0 ;;
+esac
+
+# THE KV COPY IS GONE: no `tasks:` key is written or read anywhere.
+# FAILING EDIT: put `env.OTTO.put(`tasks:${accountId}`, "x")` back in run.js.
+literals=$(for f in $SRC $RUN $FEED; do strip "$f"; done | grep -c '`tasks:')
+[ "$literals" = "0" ]
+check "no tasks: KV key anywhere: the summary is read from D1, never copied" $?
 
 echo "tasks — the Workflow:"
 
@@ -216,7 +228,7 @@ done
 create=$(body "$SRC" createTask)
 limit_line=$(echo "$create" | grep -n '"task_limit"' | head -1 | cut -d: -f1)
 create_line=$(echo "$create" | grep -n 'TASKS\.create' | head -1 | cut -d: -f1)
-put_line=$(echo "$create" | grep -n 'put(taskDayKey' | head -1 | cut -d: -f1)
+put_line=$(echo "$create" | grep -n 'bump(env, accountId, \[\[b.task' | head -1 | cut -d: -f1)
 if [ -n "$limit_line" ] && [ -n "$create_line" ] && [ -n "$put_line" ] && [ "$limit_line" -lt "$put_line" ] && [ "$put_line" -lt "$create_line" ]; then
     check "createTask checks the cap, counts, then creates — in that order" 0
 else

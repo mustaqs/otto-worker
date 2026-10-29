@@ -79,8 +79,10 @@ COMPOSIO_AUTH_CONFIG_GDRIVE = "ac_U5sti7s4EAnX"
 COMPOSIO_AUTH_CONFIG_NOTION = "ac_AEAcmoors-ge"
 COMPOSIO_AUTH_CONFIG_LINEAR = "ac_IK7XxJ5S7TV-"
 
-# THE DAILY CLEANUP (2026-10-29): finished tasks past their three days are
-# deleted at 04:00 UTC (src/tasks/run.js purgeExpired). Cron triggers are on the
-# Workers Free plan.
+# THE HOURLY CLEANUP (2026-10-29): finished tasks past their three days are
+# deleted on the hour (src/tasks/run.js purgeExpired), so a record is gone
+# within an hour of its three days; counters whose window has ended go with
+# them (src/counters.js purgeCounters). One of the Workers Free plan's five
+# cron triggers.
 [triggers]
-crons = ["0 4 * * *"]
+crons = ["0 * * * *"]

@@ -19,8 +19,9 @@ import {
 } from "./tools.js";
 // Long-running tasks (SPEC.md A82). The registry and the header composer are
 // pure; run.js holds the D1 helpers the task routes share with the Workflow.
-// None of this is on the question path except the one pure header composer,
-// which checkLimits feeds from a KV key — Bench/check-task-path.sh.
+// None of this is on the question path except the pure header composer and
+// summaryQuery, the one read checkLimits batches with its counters (from D1
+// since 2026-10-29) — Bench/check-task-path.sh.
 import {
   TYPES, TASK_VERSION, CREATE_KEYS, REQUEST_MAX_CHARS, CONTEXT_MAX_CHARS, DOCUMENT_MAX_BYTES,
   BROWSER_MODES, URL_MAX_CHARS, BROWSER_MAX_STEPS, BROWSER_MAX_CALLS, SPOKEN_MAX_CHARS,
@@ -28,14 +29,19 @@ import {
 import {
   STEP_KEYS, STEP_KINDS, STEP_BODY_MAX_BYTES, STEP_LABEL_MAX, STEP_SENTENCE_MAX, ANSWER_MAX, ledgerText, stepsOf,
 } from "./tasks/browser.js";
-import { tasksHeader, TERMINAL, BROWSER_END_REASONS } from "./tasks/summary.js";
+import { tasksHeader, summaryFromRows, TERMINAL, BROWSER_END_REASONS } from "./tasks/summary.js";
 import {
-  insertRow, readRow, deleteRow, purgeExpired, markState, finishTask, taskRows, writeSummary,
+  insertRow, readRow, deleteRow, purgeExpired, markState, finishTask, taskRows, summaryQuery,
   tasksHeaderFor, deleteInstance, terminateInstance, appendStep, countCall,
 } from "./tasks/run.js";
 // The feed (A84): the account's tasks as server-sent events, and the one
 // projection the feed and the list share.
 import { openFeed, projectRow } from "./tasks/feed.js";
+// The counters (2026-10-29): in D1, and the KV marker for an account at a cap.
+import {
+  buckets, countersQuery, countsFrom, readCounts, bump, purgeCounters,
+  capKey, markerFor, writeMarker, markerHolds,
+} from "./counters.js";
 import { cleanTitle, fallbackTitle } from "./tasks/title.js";
 
 const ANTHROPIC = "https://api.anthropic.com/v1/messages";
@@ -68,9 +74,10 @@ const STEP_MODELS = new Set([
 ]);
 
 export default {
-  /** The daily cleanup (wrangler.toml's cron trigger): finished tasks past their three days. */
+  /** The hourly cleanup (wrangler.toml's cron trigger): finished tasks past their three days, and counters whose window has ended. */
   async scheduled(event, env, ctx) {
     ctx.waitUntil(purgeExpired(env).catch((error) => console.error("task cleanup failed:", String(error && error.name || "error"))));
+    ctx.waitUntil(purgeCounters(env).catch((error) => console.error("counter cleanup failed:", String(error && error.name || "error"))));
   },
 
   async fetch(request, env, ctx) {
@@ -88,9 +95,11 @@ export default {
     if (request.method !== "POST") return problem(405, "method_not_allowed");
 
     // Registration is a separate route on purpose, and it is the ONLY other one.
-    // Everything the question path needs is below; nothing it calls reaches D1
-    // or any identity provider. Bench/check-question-path.sh asserts that by
-    // grep rather than by reading, in the style of the app's check-monitors.sh.
+    // Everything the question path needs is below; it reads D1 only for its
+    // counters and task rows, beside the upstream call, and writes nothing
+    // there but the counters; it never reaches an identity provider.
+    // Bench/check-question-path.sh asserts that by grep rather than by
+    // reading, in the style of the app's check-monitors.sh.
     if (url.pathname === "/v1/device") return registerDevice(request, env);
     // Sign-in is two more routes, two more requests, and — like registration —
     // NOT the question path. Supabase is reached from these and nowhere else.
@@ -106,7 +115,7 @@ export default {
     if (url.pathname === "/v1/integrations/webhook") return integrationsWebhook(request, env);
     // Tasks (A82): six routes, none of them the question path. D1 and the
     // Workflow binding are reached from these and from the Workflow itself;
-    // a question reads one KV key and nothing else — Bench/check-task-path.sh.
+    // a question reads the task rows and writes none — Bench/check-task-path.sh.
     if (url.pathname === "/v1/tasks/create") return createTask(request, env);
     if (url.pathname === "/v1/tasks/approve") return approveTask(request, env);
     if (url.pathname === "/v1/tasks/cancel") return cancelTask(request, env);
@@ -125,10 +134,11 @@ export default {
     const token = bearer(request);
     if (!token) return problem(401, "missing_token");
 
-    // Broken into parts because "auth costs 600ms" is not actionable: a token
-    // read, two counter reads and two counter writes are three round trips with
-    // very different costs, and optimising the wrong one is how A20 went.
-    const timing = { tokenRead: 0, counterRead: 0, counterWrite: 0 };
+    // Broken into parts because "auth costs 600ms" is not actionable: the
+    // token read, the cap marker's read and the D1 counter read are three
+    // round trips with very different costs, and optimising the wrong one is
+    // how A20 went. `d1` runs WHILE Anthropic works, so it is not in `auth`.
+    const timing = { tokenRead: 0, capRead: 0, d1: 0 };
 
     const tToken = Date.now();
     const account = await loadAccount(env, token);
@@ -137,39 +147,15 @@ export default {
     if (!account) return problem(401, "unknown_token");
     if (!account.active) return problem(403, "revoked");
 
-    // Checked before the upstream call, so a failure downstream still counts and
-    // does not hand out a free retry. The INCREMENT is deferred — see below.
-    const gate = await checkLimits(env, account, timing);
-    if (gate.refused) return gate.refused;
-
-    /*
-     * The counter write costs ~290ms and is deliberately OFF the critical path.
-     *
-     * Measured: kvwrite was a stable ~290ms of a ~600ms auth phase, while reads
-     * ranged 4-158ms depending on edge cache warmth. Nothing downstream depends
-     * on the write having landed, so waiting for it spent a third of a second
-     * on every question to make a counter durable a moment sooner.
-     *
-     * Scheduled here rather than after the upstream call, so a request that
-     * fails at Anthropic still counts. What is given up: a write that fails is
-     * lost, and repeated failures would accrue free requests. That is a
-     * deliberate reliability trade, so it is logged rather than swallowed.
-     */
-    defer(ctx, gate.commit(), "counter increment");
+    // THE CAP MARKER, before anything is spent (2026-10-29). An account that
+    // has reached a cap is refused here, from KV, and its question never
+    // starts a paid request upstream. src/counters.js says why it exists.
+    const tCap = Date.now();
+    const capped = await cappedRefusal(env, account, new Date());
+    timing.capRead = Date.now() - tCap;
+    if (capped) return capped;
     const afterKV = Date.now();
 
-    /*
-     * BOUNDED BEFORE IT IS PARSED. `MAX_BODY_BYTES` was declared in
-     * wrangler.toml from the first deploy and enforced nowhere — a declared cap
-     * that nothing reads is a comment. A question is a ~200KB body (one 1200px
-     * JPEG as base64 plus a few KB of text and, since Otto's A72, up to five
-     * remembered exchanges of plain text); the cap is thirty times that, so it
-     * bounds abuse rather than use. Checked on the declared length first, then
-     * on the bytes actually received, because Content-Length is a claim. The
-     * body is read as bytes and decoded once, so this adds no copy that
-     * `request.json()` was not already making. 413, and a code Otto's
-     * RelayError maps to "a bug in Otto" — the user cannot act on it.
-     */
     const maxBody = Number(env.MAX_BODY_BYTES) || 6_000_000;
     const declared = Number(request.headers.get("content-length"));
     if (declared > maxBody) return problem(413, "body_too_large");
@@ -186,8 +172,20 @@ export default {
     const rejection = validate(body, env);
     if (rejection) return rejection;
 
+    /*
+     * THE COUNTERS ARE READ WHILE ANTHROPIC WORKS (2026-10-29, option A).
+     * They live in D1 now, a round trip of 80-130 ms where KV's was 5, so the
+     * upstream request is started first and the read runs beside it; its
+     * answer is in long before Anthropic's first byte. Over a cap, the
+     * upstream request is ABORTED and the refusal is returned, with nothing
+     * of the answer forwarded — and the marker is written so the next
+     * attempt is refused before it starts. Under it, the increment is
+     * scheduled, counted before the answer so a failure downstream still
+     * counts and does not hand out a free retry.
+     */
+    const controller = new AbortController();
     const beforeUpstream = Date.now();
-    const upstream = await fetch(ANTHROPIC, {
+    const upstreamCall = fetch(ANTHROPIC, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -195,7 +193,21 @@ export default {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
+    // An aborted call rejects; on the refusal path nobody awaits it.
+    upstreamCall.catch(() => {});
+
+    const gate = await checkLimits(env, account, timing);
+    if (gate.refused) {
+      controller.abort();
+      console.log("question refused by the counters: the upstream request was aborted");
+      defer(ctx, gate.mark(), "cap marker");
+      return gate.refused;
+    }
+    defer(ctx, gate.commit(), "counter increment");
+
+    const upstream = await upstreamCall;
 
     if (!upstream.ok) {
       // A REJECTION IS CLASSIFIED, AND ITS WORDS ARE NOT KEPT: the error
@@ -239,7 +251,7 @@ export default {
      * longer 1:1 with a question the user asked — a new category of request,
      * triggered by a UI gesture, needing its own line in the privacy page.
      * Here there is no new request, no new endpoint and no new state: every
-     * number was already read by checkLimits before the upstream call.
+     * number was already read by checkLimits while the upstream call ran.
      *
      * It rides on the response head, which Workers emit as soon as the
      * upstream headers arrive, so Otto has the numbers at time-to-first-token
@@ -251,8 +263,8 @@ export default {
       status: 200,
       headers: {
         ...gate.usage,
-        // `otto-tasks` (A82), from the KV summary checkLimits already read
-        // beside the counters. Absent when there is no summary: the app
+        // `otto-tasks` (A82), from the rows checkLimits read beside the
+        // counters. Absent when that read failed, or for a trial: the app
         // reads absence as "no information", never as "no tasks".
         ...gate.tasks,
         "content-type": "text/event-stream; charset=utf-8",
@@ -262,9 +274,12 @@ export default {
           `cold;dur=${cold ? 1 : 0}`,
           `auth;dur=${afterKV - t0}`,
           `kvtoken;dur=${timing.tokenRead}`,
-          `kvread;dur=${timing.counterRead}`,
-          `kvwrite;dur=${timing.counterWrite}`,
+          `kvcap;dur=${timing.capRead}`,
+          // Beside `upstream`, not before it: `head` is what the question
+          // waited for, and it moves only if d1 ever outlasts Anthropic.
+          `d1;dur=${timing.d1}`,
           `upstream;dur=${upstreamMs}`,
+          `head;dur=${total}`,
           `relay;dur=${total - upstreamMs}`,
         ].join(", "),
       },
@@ -291,8 +306,8 @@ export default {
  * ever actually exploited; fingerprinting is not, and the SPEC amendment says so
  * to stop a later reader "fixing" it that way.
  *
- * D1 IS WRITTEN HERE AND NEVER ON THE QUESTION PATH. This route exists so that
- * /v1/ask can read one KV record and nothing else.
+ * THE DEVICE ROW IS WRITTEN HERE AND NEVER ON THE QUESTION PATH, which writes
+ * only its counters to D1 and reads the token from KV alone.
  */
 async function registerDevice(request, env) {
   const plan = await loadPlan(env, "trial");
@@ -463,44 +478,75 @@ async function loadAccount(env, token) {
  * which at Opus rates is about $0.007 of input whether the answer is one line
  * or ten. `MAX_OUTPUT_TOKENS` caps the other side. Set caps knowing that.
  *
- * KV is eventually consistent, so a user may occasionally get one or two over
- * their cap. That is a cent, and it is the right trade for not needing a
- * strongly consistent store on the hot path.
+ * Since 2026-10-29 the counters are D1 rows, incremented atomically, and an
+ * account at a cap is refused from a KV marker that reaches other locations
+ * within about a minute: a user may occasionally get one or two over their
+ * cap there, and those are aborted before Anthropic answers. That is a cent
+ * at most, and the right trade for keeping D1 off the critical path.
  */
 /**
- * Reads the counters and decides. Returns either a refusal or a `commit` that
- * performs the increment — separated so the caller can schedule the write
- * instead of awaiting it.
+ * The cap marker's refusal, or null (2026-10-29). One KV read beside
+ * nothing: the subject comes from the token record. A marker past its window,
+ * or below a cap the account no longer has, is ignored. The refusal is the
+ * one checkLimits would give, with the counts the marker was written with.
+ */
+async function cappedRefusal(env, account, now) {
+  let marker = null;
+  try { marker = JSON.parse(await env.OTTO.get(capKey(account.subject))); } catch { marker = null; }
+  if (!markerHolds(marker, account, now)) return null;
+  const usage = usageHeader(account, { day: Number(marker.day) || 0, hour: Number(marker.hour) || 0, total: Number(marker.total) || 0 }, now, false);
+  if (marker.code === "trial_exhausted") return problem(403, "trial_exhausted", {}, usage);
+  const retryAfter = marker.code === "hourly_limit" ? secondsToNextHour(now) : secondsToNextDay(now);
+  return problem(429, marker.code, { retryAfter }, usage);
+}
+
+/**
+ * Reads the counters and the account's task rows from D1, in one batch, and
+ * decides. Returns either a refusal with a `mark` that writes the cap marker,
+ * or a `commit` that performs the increment — separated so the caller can
+ * schedule the writes instead of awaiting them.
+ *
+ * RUN BESIDE THE UPSTREAM REQUEST, never before it (see the question path).
+ * A D1 failure FAILS OPEN: the question is answered, uncounted reads as zero,
+ * the task header is left out, and the failure is logged by class.
  */
 async function checkLimits(env, account, timing = {}) {
   const now = new Date();
   // KEYED ON THE SUBJECT, NOT THE TOKEN. Two devices on one account share one
   // quota, which is what a subscription means to the person paying for it.
-  const { dayKey, hourKey, totalKey, tasksKey } = counterKeys(account.subject, now);
+  const b = buckets(now);
   const onTrial = account.kind === "trial" && account.trialCap > 0;
 
-  // THE TASK SUMMARY RIDES IN THE SAME ROUND TRIP (A82). One more KV key,
-  // read beside the counters inside the one Promise.all, so a question
-  // learns of a finished task with no new request, no new binding and no
-  // added latency — at KV's sixty-second edge cache, which A26 records. READ
-  // AND NEVER WRITTEN HERE: the Workflow and the task routes rewrite it from
-  // D1, and Bench/check-task-path.sh asserts this function has no put of it.
-  // A trial has no account and so no tasks; its read is skipped.
+  // THE TASK ROWS RIDE IN THE SAME ROUND TRIP (A82, from D1 since
+  // 2026-10-29). One more statement in the one batch, so a question learns of
+  // a finished task with no new request and no added wait. READ AND NEVER
+  // WRITTEN HERE: an expired row is left out by the query, not deleted —
+  // Bench/check-task-path.sh asserts this function writes no task row. A trial
+  // has no account and so no tasks; its read is skipped.
+  //
+  // A TRIAL'S TOTAL FROM BEFORE THE MOVE is in KV under its old key; it is
+  // read beside the batch and seeds the D1 row on its first increment, so a
+  // trial that had spent seven questions still has three, not ten.
   const tRead = Date.now();
-  const [dayRaw, hourRaw, totalRaw, tasksRaw] = await Promise.all([
-    env.OTTO.get(dayKey),
-    env.OTTO.get(hourKey),
-    onTrial ? env.OTTO.get(totalKey) : Promise.resolve(null),
-    onTrial ? Promise.resolve(null) : env.OTTO.get(tasksKey),
-  ]);
-  timing.counterRead = Date.now() - tRead;
-  const dayCount = Number(dayRaw) || 0;
-  const hourCount = Number(hourRaw) || 0;
-  const totalCount = Number(totalRaw) || 0;
-  let tasks = {};
-  if (tasksRaw) {
-    try { tasks = tasksHeader(JSON.parse(tasksRaw)); } catch { tasks = {}; }
+  let counts = {}, rows = null, carried = 0;
+  try {
+    const statements = [countersQuery(env, account.subject, onTrial ? [b.day, b.hour, b.total] : [b.day, b.hour])];
+    if (!onTrial) statements.push(summaryQuery(env, account.subject, now.getTime()));
+    const [results, legacyTotal] = await Promise.all([
+      env.DB.batch(statements),
+      onTrial ? env.OTTO.get(`u:${account.subject}:total`) : Promise.resolve(null),
+    ]);
+    counts = countsFrom(results[0]);
+    if (!onTrial) rows = (results[1] && results[1].results) || [];
+    carried = Number(legacyTotal) || 0;
+  } catch (error) {
+    console.error(`counters unreadable, question allowed (${error && error.name ? error.name : "error"})`);
   }
+  timing.d1 = Date.now() - tRead;
+  const dayCount = counts[b.day] || 0;
+  const hourCount = counts[b.hour] || 0;
+  const totalCount = counts[b.total] === undefined ? carried : counts[b.total];
+  const tasks = rows ? tasksHeader(summaryFromRows(rows, now.getTime())) : {};
 
   // The hourly limit is the real protection against a runaway bill: a daily cap
   // can still be burned through in a minute by a loop.
@@ -518,8 +564,14 @@ async function checkLimits(env, account, timing = {}) {
    * day for anyone west of Greenwich; "resets in 6h" is true everywhere and
    * needs no timezone to exist anywhere in the system.
    */
-  const usage = (inclusive) =>
-    usageHeader(account, { day: dayCount, hour: hourCount, total: totalCount }, now, inclusive);
+  const current = { day: dayCount, hour: hourCount, total: totalCount };
+  const usage = (inclusive) => usageHeader(account, current, now, inclusive);
+  // A refusal here means the marker was missing (another location had not
+  // seen it yet, or its write failed): write it now, at the counts as read.
+  const mark = () => {
+    const marker = markerFor(account, current, now);
+    return marker ? writeMarker(env, account.subject, marker) : Promise.resolve(false);
+  };
 
   // The refusal carries the counts too. It is the moment a user most wants to
   // see the bar full, and it means Otto has one place that parses this.
@@ -530,33 +582,41 @@ async function checkLimits(env, account, timing = {}) {
   //
   // No retryAfter: there is no time at which this resolves itself.
   if (onTrial && totalCount >= account.trialCap) {
-    return { refused: problem(403, "trial_exhausted", {}, { ...usage(false), ...tasks }) };
+    return { refused: problem(403, "trial_exhausted", {}, { ...usage(false), ...tasks }), mark };
   }
 
   if (account.hourlyCap > 0 && hourCount >= account.hourlyCap) {
     return {
       refused: problem(429, "hourly_limit",
                        { retryAfter: secondsToNextHour(now) }, { ...usage(false), ...tasks }),
+      mark,
     };
   }
   if (account.dailyCap > 0 && dayCount >= account.dailyCap) {
     return {
       refused: problem(429, "daily_limit",
                        { retryAfter: secondsToNextDay(now) }, { ...usage(false), ...tasks }),
+      mark,
     };
   }
 
-  timing.counterWrite = 0;   // no longer on the critical path
+  // THE LAST ALLOWED QUESTION WRITES THE MARKER, so the next one is refused
+  // from KV before anything is spent. Counts here include this question.
+  const after = { day: dayCount + 1, hour: hourCount + 1, total: totalCount + 1 };
+  const reached = markerFor(account, after, now);
   return {
     refused: null,
     usage: usage(true),
     tasks,
     commit: () =>
       Promise.all([
-        safePut(env, dayKey, String(dayCount + 1), { expirationTtl: 60 * 60 * 48 }, "day counter"),
-        safePut(env, hourKey, String(hourCount + 1), { expirationTtl: 60 * 60 * 2 }, "hour counter"),
-        // No expirationTtl, deliberately. See the key's comment above.
-        ...(onTrial ? [safePut(env, totalKey, String(totalCount + 1), undefined, "trial total")] : []),
+        bump(env, account.subject, [
+          [b.day, b.dayEnds, 0],
+          [b.hour, b.hourEnds, 0],
+          // No expiry, deliberately: a trial is a lifetime count.
+          ...(onTrial ? [[b.total, null, totalCount]] : []),
+        ], "question counters"),
+        reached ? writeMarker(env, account.subject, reached) : null,
       ]),
   };
 }
@@ -590,31 +650,6 @@ function usageHeader(account, counts, now, inclusive) {
       `hour-resets=${secondsToNextHour(now)}`,
       ...(onTrial ? [`trial=${counts.total + plus}`, `trial-cap=${account.trialCap}`] : []),
     ].join(";"),
-  };
-}
-
-/**
- * The counter keys for a subject at a moment. Pure, so the question path and
- * sign-in's usage reply agree on the key format by construction rather than by
- * two copies of a template string.
- *
- * The trial is a LIFETIME count, so it gets its own key with NO expiry. The day
- * and hour keys carry TTLs (set where they are written) because a window that
- * has rolled over is meaningless; a trial that expired after 48 hours would
- * simply hand out a fresh ten, which is the opposite of a cap.
- */
-function counterKeys(subject, now) {
-  const day = now.toISOString().slice(0, 10);          // YYYY-MM-DD
-  const hour = now.toISOString().slice(0, 13);         // YYYY-MM-DDTHH
-  return {
-    dayKey: `u:${subject}:d:${day}`,
-    hourKey: `u:${subject}:h:${hour}`,
-    totalKey: `u:${subject}:total`,
-    // The account's task summary (A82): written by the Workflow and the task
-    // routes, read by the question path. The one `tasks:` literal in this file.
-    tasksKey: `tasks:${subject}`,
-    // The task day counter (A82), the shape of the tool counter in runTool.
-    taskDayKey: `u:${subject}:k:${day}`,
   };
 }
 
@@ -838,9 +873,12 @@ async function signInVerify(request, env) {
   }
 
   const at = new Date();
-  const keys = counterKeys(account.id, at);
-  const [dayRaw, hourRaw] = await Promise.all([env.OTTO.get(keys.dayKey), env.OTTO.get(keys.hourKey)]);
-  const header = usageHeader(record, { day: Number(dayRaw) || 0, hour: Number(hourRaw) || 0, total: 0 }, at, false);
+  const b = buckets(at);
+  let counts = {};
+  try { counts = await readCounts(env, account.id, [b.day, b.hour]); } catch (error) {
+    console.error(`counters unreadable at sign-in (${error && error.name ? error.name : "error"})`);
+  }
+  const header = usageHeader(record, { day: counts[b.day] || 0, hour: counts[b.hour] || 0, total: 0 }, at, false);
   return json200({ token, email: user.email }, header);
 }
 
@@ -881,7 +919,8 @@ async function findOrCreateAccount(env, user, plan) {
 /**
  * Connected apps: Gmail, Google Calendar and Slack through Composio (SPEC.md
  * A76). Five routes plus the browser callback, and NONE OF THEM IS THE
- * QUESTION PATH — a question still touches KV and Anthropic and nothing else.
+ * QUESTION PATH — a question touches KV, its counters and task rows in D1,
+ * and Anthropic, and nothing else.
  *
  * WHAT THE WORKER HOLDS: `COMPOSIO_API_KEY`, read in exactly one function
  * (`composio`); `COMPOSIO_WEBHOOK_SECRET`, read in one; and, in D1, which apps
@@ -982,8 +1021,8 @@ async function runTool(request, env) {
   // here; zero means no gate, as for every other cap.
   const plan = await loadPlanCaps(env, auth.account.plan);
   const toolCap = plan ? Number(plan.tool_cap) || 0 : 0;
-  const toolKey = `u:${accountId}:t:${new Date().toISOString().slice(0, 10)}`;
-  const used = Number(await env.OTTO.get(toolKey)) || 0;
+  const b = buckets(new Date());
+  const used = (await readCounts(env, accountId, [b.tool]))[b.tool] || 0;
   if (toolCap > 0 && used >= toolCap) return problem(429, "tool_limit");
 
   let rows;
@@ -1014,7 +1053,7 @@ async function runTool(request, env) {
   if (!args) return problem(400, "unknown_tool", {}, headers);
 
   // Counted before the call, like questions: a failed call still counts.
-  await safePut(env, toolKey, String(used + 1), { expirationTtl: 60 * 60 * 48 }, "tool counter");
+  await bump(env, accountId, [[b.tool, b.dayEnds, 0]], "tool counter");
 
   const reply = await composio(env, "POST", `/tools/execute/${spec.slug}`, {
     user_id: accountId,
@@ -1348,8 +1387,8 @@ async function integrationsWebhook(request, env) {
  * path. A task is a D1 row and a Workflow instance with the same id; the row
  * is the truth, the instance is the engine, and src/tasks/run.js is what
  * passes between them. The task routes write the row, speak to the instance
- * (create, sendEvent, terminate, delete) and rewrite the KV summary; the
- * Workflow does the same from inside its steps.
+ * (create, sendEvent, terminate, delete); the Workflow does the same from
+ * inside its steps. The question reads the rows themselves (summaryQuery).
  *
  * WHO A TASK BELONGS TO: the account subject, as a tool does. A trial device
  * is refused with `needs_account` before anything is read. Every row read
@@ -1434,13 +1473,13 @@ async function createTask(request, env) {
   // The task cap, from the plan row, counted before the create (like tools).
   const plan = await loadPlanCaps(env, auth.account.plan);
   const taskCap = plan ? Number(plan.task_cap) || 0 : 0;
-  const { taskDayKey } = counterKeys(accountId, new Date());
-  const used = Number(await env.OTTO.get(taskDayKey)) || 0;
-  // The day is UTC (counterKeys), so the cap resets at the next UTC midnight;
+  const b = buckets(new Date());
+  const used = (await readCounts(env, accountId, [b.task]))[b.task] || 0;
+  // The day is UTC (buckets), so the cap resets at the next UTC midnight;
   // the app says when in the user's own clock (A91).
-  const resetsAt = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate() + 1);
+  const resetsAt = b.dayEnds;
   if (taskCap > 0 && used >= taskCap) return problem(429, "task_limit", { cap: taskCap, resetsAt }, await safeTasksHeader(env, accountId));
-  await safePut(env, taskDayKey, String(used + 1), { expirationTtl: 60 * 60 * 48 }, "task counter");
+  await bump(env, accountId, [[b.task, b.dayEnds, 0]], "task counter");
 
   const id = crypto.randomUUID();
   const createdAt = Date.now();
@@ -1465,7 +1504,6 @@ async function createTask(request, env) {
     await deleteRow(env, { id, accountId });
     return problem(502, "task_not_started", {}, await safeTasksHeader(env, accountId));
   }
-  await writeSummary(env, accountId);
   console.log(`task ${type} created`);
   return json200({ id, state: "created" }, await safeTasksHeader(env, accountId));
 }
@@ -1633,14 +1671,14 @@ async function askStep(request, env, ctx, t0 = Date.now()) {
 
   const task = { id, accountId };
   const now = new Date(Date.now());
-  const stepDayKey = `u:${accountId}:s:${now.toISOString().slice(0, 10)}`;
+  const b = buckets(now);
   const tD1 = Date.now();
   let counted, plan, used;
   try {
     [counted, plan, used] = await Promise.all([
       countCall(env, task, BROWSER_MAX_CALLS),
       env.DB.prepare(`SELECT step_cap FROM plans WHERE name = ?`).bind(auth.account.plan).first(),
-      env.OTTO.get(stepDayKey),
+      readCounts(env, accountId, [b.step]).then((counts) => counts[b.step] || 0),
     ]);
   } catch (error) {
     console.error("browser step call not counted:", String(error && error.name || "error"));
@@ -1665,12 +1703,11 @@ async function askStep(request, env, ctx, t0 = Date.now()) {
   const stepCap = Number(plan.step_cap) || 0;
   const today = Number(used) || 0;
   if (stepCap > 0 && today >= stepCap) {
-    const resetsAt = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
-    return ended("step_cap", 429, "step_limit", { cap: stepCap, resetsAt });
+    return ended("step_cap", 429, "step_limit", { cap: stepCap, resetsAt: b.dayEnds });
   }
   // Off the critical path, as the question's increment is; the per-task
   // bound above is the exact one, this is the day's.
-  defer(ctx, safePut(env, stepDayKey, String(today + 1), { expirationTtl: 60 * 60 * 48 }, "step counter"), "step counter increment");
+  defer(ctx, bump(env, accountId, [[b.step, b.dayEnds, 0]], "step counter"), "step counter increment");
 
   const beforeUpstream = Date.now();
   const upstream = await fetch(ANTHROPIC, {
@@ -1819,7 +1856,6 @@ async function takeTask(request, env) {
 async function markSeen(env, task) {
   await env.DB.prepare(`UPDATE tasks SET seen_at = ?, updated_at = ? WHERE id = ? AND account_id = ?`)
     .bind(Date.now(), Date.now(), task.id, task.accountId).run();
-  await writeSummary(env, task.accountId);
 }
 
 /**
@@ -1835,7 +1871,6 @@ async function deleteTask(request, env) {
   if (!TERMINAL.has(row.state)) await terminateInstance(env, task.id);
   await deleteRow(env, task);
   await deleteInstance(env, task.id);
-  await writeSummary(env, task.accountId);
   console.log(`task ${row.type} deleted`);
   return json200({}, await safeTasksHeader(env, task.accountId));
 }
@@ -2004,8 +2039,9 @@ async function upstreamRefusal(upstream, where) {
 /**
  * A KV WRITE NEVER FAILS A REQUEST (2026-10-29: the account passed Workers
  * KV's free 1,000 writes a day). Logged by class and carried on: a counter
- * that cannot be written is not incremented, so its cap fails open; a token or
- * summary that cannot be written is read from D1 or written again next time.
+ * marker that cannot be written leaves the D1 check to refuse; a token that
+ * cannot be written is refused at the route that mints it. Counters and the
+ * task summary left KV the same day (src/counters.js).
  */
 export async function safePut(env, key, value, options, what) {
   try {
