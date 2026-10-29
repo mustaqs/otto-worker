@@ -6,7 +6,8 @@
  * slow, and the cause would be three layers away from the symptom.
  */
 import worker, { classifyUpstream } from "./src/index.js";
-import { purgeExpired } from "./src/tasks/run.js";
+import { purgeExpired, summaryQuery } from "./src/tasks/run.js";
+import { summaryFromRows } from "./src/tasks/summary.js";
 import { readFileSync } from "node:fs";
 
 let failures = 0;
@@ -28,12 +29,60 @@ const makeKV = (seed = {}) => {
   };
 };
 
+// A D1 stand-in for the counters (2026-10-29): the statements src/counters.js
+// sends — the read, the multi-row UPSERT, the cleanup — and a batch. Added ONTO
+// a test's own D1 stand-in, whose prepare answers every other statement.
+const withCounters = (inner = { prepare: () => ({ bind: () => ({ all: async () => ({ results: [] }), first: async () => null, run: async () => ({ meta: { changes: 0 } }) }) }) }) => {
+  const counters = new Map();   // `${subject}|${bucket}` → { n, expires_at }
+  const realPrepare = inner.prepare;
+  inner.counters = counters;
+  inner.count = (subject, bucket) => (counters.get(`${subject}|${bucket}`) || {}).n || 0;
+  inner.failCounters = false;
+  inner.batch = async (statements) => Promise.all(statements.map((statement) => statement.all()));
+  inner.prepare = (sql) => {
+    const q = sql.replace(/\s+/g, " ").trim();
+    if (!/(FROM|INTO) counters /.test(q)) {
+      // A stand-in written before the question read D1 may have no all(): its rows read as none.
+      const statement = realPrepare(sql);
+      return { ...statement, bind: (...args) => { const bound = statement.bind(...args); return bound.all ? bound : { ...bound, all: async () => ({ results: [] }) }; } };
+    }
+    return { bind: (...args) => ({
+      all: async () => {
+        if (inner.failCounters) throw Object.assign(new Error("d1 unavailable"), { name: "D1Error" });
+        const [subject, ...names] = args;
+        return { results: names.filter((b) => counters.has(`${subject}|${b}`)).map((b) => ({ bucket: b, n: counters.get(`${subject}|${b}`).n })) };
+      },
+      run: async () => {
+        if (inner.failCounters) throw Object.assign(new Error("d1 unavailable"), { name: "D1Error" });
+        if (q.startsWith("INSERT INTO counters (subject, bucket, n, expires_at) VALUES") && q.endsWith("ON CONFLICT (subject, bucket) DO UPDATE SET n = n + 1")) {
+          for (let i = 0; i < args.length; i += 4) {
+            const [subject, bucket, n, expiresAt] = args.slice(i, i + 4), key = `${subject}|${bucket}`;
+            if (counters.has(key)) counters.get(key).n += 1; else counters.set(key, { n, expires_at: expiresAt });
+          }
+          return { meta: { changes: args.length / 4 } };
+        }
+        if (q.startsWith("DELETE FROM counters WHERE expires_at IS NOT NULL AND expires_at < ?")) {
+          let changes = 0;
+          for (const [key, row] of [...counters]) if (row.expires_at != null && row.expires_at < args[0]) { counters.delete(key); changes++; }
+          return { meta: { changes } };
+        }
+        throw new Error(`unexpected counters statement: ${q}`);
+      },
+    }) };
+  };
+  return inner;
+};
+
 const goodToken = "beta-abc";
 const account = (over = {}) =>
   JSON.stringify({ v: 1, name: "tester", active: true, dailyCap: 100, hourlyCap: 10, ...over });
 
-const env = (kv) => ({
+// One D1 per KV: tests that build env(kv) again for each question share counters, as one relay does.
+const counterDBs = new WeakMap();
+const sharedDB = (kv) => { if (!counterDBs.has(kv)) counterDBs.set(kv, withCounters()); return counterDBs.get(kv); };
+const env = (kv, db = sharedDB(kv)) => ({
   OTTO: kv,
+  DB: db,
   ANTHROPIC_API_KEY: "sk-test",
   MAX_OUTPUT_TOKENS: "4096",
   MAX_IMAGES: "2",
@@ -117,7 +166,7 @@ console.log("streaming (the one that matters):");
   const timing = response.headers.get("server-timing") || "";
   check("reports its own overhead, so relay cost is separable from Anthropic's",
         /cold;dur=[01]/.test(timing) && /upstream;dur=\d+/.test(timing) && /relay;dur=\d+/.test(timing)
-        && /kvtoken;dur=\d+/.test(timing) && /kvread;dur=\d+/.test(timing) && /kvwrite;dur=\d+/.test(timing),
+        && /kvtoken;dur=\d+/.test(timing) && /kvcap;dur=\d+/.test(timing) && /d1;dur=\d+/.test(timing) && /head;dur=\d+/.test(timing),
         timing);
 
   releaseSecondChunk();
@@ -133,12 +182,18 @@ globalThis.fetch = async () => new Response(new ReadableStream({ start: (c) => c
 // KV WRITES REFUSED (2026-10-29: past Workers KV's free daily writes): a question still answers.
 {
   const kv = makeKV({ [`token:${goodToken}`]: account() });
-  kv.put = async () => { throw new Error("KV put() limit exceeded for the day."); };
-  const realError = console.error; const logged = []; console.error = (...a) => logged.push(a.join(" "));
+  const puts = [];
+  kv.put = async (k) => { puts.push(k); throw new Error("KV put() limit exceeded for the day."); };
   const r = await send(env(kv));
+  check("a question writes nothing to KV, so refused KV writes cannot touch it", r.status === 200 && puts.length === 0, puts.join(","));
+  // The last question under a cap writes the marker: refused, it is logged by class and the answer still comes.
+  const capped = makeKV({ [`token:${goodToken}`]: account({ hourlyCap: 1 }) });
+  capped.put = async () => { throw new Error("KV put() limit exceeded for the day."); };
+  const realError = console.error; const logged = []; console.error = (...a) => logged.push(a.join(" "));
+  const last = await send(env(capped));
   console.error = realError;
-  check("a question still answers when every KV write is refused, and the failure is logged by class",
-        r.status === 200 && logged.some((l) => l.startsWith("kv write failed (day counter)")) && !logged.some((l) => l.includes("limit exceeded")));
+  check("a refused marker write is logged by class and the question still answers",
+        last.status === 200 && logged.some((l) => l.startsWith("kv write failed (cap marker)")) && !logged.some((l) => l.includes("limit exceeded")));
 }
 {
   const kv = makeKV({ [`token:${goodToken}`]: account() });
@@ -160,9 +215,11 @@ globalThis.fetch = async () => new Response(new ReadableStream({ start: (c) => c
 console.log("limits:");
 {
   const kv = makeKV({ [`token:${goodToken}`]: account({ hourlyCap: 2, dailyCap: 100 }) });
-  const first = await send(env(kv));
-  const second = await send(env(kv));
-  const third = await send(env(kv));
+  const shared = env(kv);   // one D1: the counters live there
+  const first = await send(shared);
+  const second = await send(shared);
+  kv.store.delete(`cap:${goodToken}`);   // refused by D1 itself, not only by the marker
+  const third = await send(shared);
   check("under the hourly cap passes", first.status === 200 && second.status === 200);
   check("over the hourly cap is refused", third.status === 429);
   const body = await third.json();
@@ -170,17 +227,20 @@ console.log("limits:");
         body.error === "hourly_limit" && typeof body.retryAfter === "number");
 
   const daily = makeKV({ [`token:${goodToken}`]: account({ hourlyCap: 0, dailyCap: 1 }) });
-  await send(env(daily));
+  const dailyEnv = env(daily);
+  await send(dailyEnv);
+  daily.store.delete(`cap:${goodToken}`);
   check("daily cap is enforced separately",
-        (await send(env(daily))).status === 429);
+        (await send(dailyEnv)).status === 429);
 
-  // Counted before the upstream call: a failure downstream must not be free.
+  // Counted before the answer: a failure downstream must not be free.
   const counted = makeKV({ [`token:${goodToken}`]: account() });
+  const countedEnv = env(counted);
   globalThis.fetch = async () => new Response("nope", { status: 500 });
-  await send(env(counted));
+  await send(countedEnv);
   const day = new Date().toISOString().slice(0, 10);
   check("a failed upstream call still counts against the cap",
-        counted.store.get(`u:${goodToken}:d:${day}`) === "1");
+        countedEnv.DB.count(goodToken, `d:${day}`) === 1);
   globalThis.fetch = async () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
 }
 
@@ -272,7 +332,8 @@ console.log("usage reported back to the person it is about:");
 console.log("registration says the trial's number before a question is spent:");
 {
   // A D1 stand-in with the prepare/bind/first/run surface registerDevice uses.
-  const makeDB = (plan, { failInsert = false } = {}) => {
+  const makeDB = (...a) => withCounters(makeDBBase(...a));
+  const makeDBBase = (plan, { failInsert = false } = {}) => {
     const runs = [];
     return {
       runs,
@@ -363,7 +424,8 @@ console.log("sign-in (two requests, and neither is the question path):");
   };
 
   // A D1 stand-in that keeps rows, so what verify wrote can be read back.
-  const makeDB = ({ failWrites = false } = {}) => {
+  const makeDB = (...a) => withCounters(makeDBBase(...a));
+  const makeDBBase = ({ failWrites = false } = {}) => {
     const accounts = [], devices = [];
     return {
       accounts, devices,
@@ -603,35 +665,142 @@ console.log("sign-in (two requests, and neither is the question path):");
 console.log("deferring the counter write:");
 {
   const kv = makeKV({ [`token:${goodToken}`]: account() });
-  // A KV whose writes are slow. If the response waits on them, this shows up.
-  const slow = { ...kv, put: async (k, v) => { await new Promise((r) => setTimeout(r, 300)); return kv.put(k, v); } };
+  // A D1 whose counter writes are slow. If the response waits on them, this shows up.
+  const db = withCounters();
+  const counterPrepare = db.prepare;
+  db.prepare = (sql) => {
+    const statement = counterPrepare(sql);
+    if (!sql.startsWith("INSERT INTO counters")) return statement;
+    return { bind: (...args) => ({ run: async () => { await new Promise((r) => setTimeout(r, 300)); return statement.bind(...args).run(); } }) };
+  };
   const ctx = makeCtx();
   const started = Date.now();
-  const response = await worker.fetch(ask(valid), { ...env(kv), OTTO: slow }, ctx);
+  await worker.fetch(ask(valid), env(kv, db), ctx);
   const elapsed = Date.now() - started;
   check("the response does not wait for the counter write", elapsed < 200, `${elapsed}ms`);
-  check("timing reports the write as off the critical path",
-        /kvwrite;dur=0/.test(response.headers.get("server-timing") || ""));
   await ctx.settle();
   const day = new Date().toISOString().slice(0, 10);
   check("and the write still lands once the runtime runs it",
-        kv.store.get(`u:${goodToken}:d:${day}`) === "1");
+        db.count(goodToken, `d:${day}`) === 1 && db.count(goodToken, `h:${new Date().toISOString().slice(0, 13)}`) === 1);
 }
 {
   // A lost write is a free request, so it must not be silent.
   const kv = makeKV({ [`token:${goodToken}`]: account() });
-  const broken = { ...kv, put: async () => { throw new Error("kv unavailable"); } };
+  const db = withCounters();
+  db.failCounters = true;
   const ctx = makeCtx();
   const errors = [];
   const realError = console.error;
   console.error = (m) => errors.push(String(m));
-  await worker.fetch(ask(valid), { ...env(kv), OTTO: broken }, ctx);
+  const r = await worker.fetch(ask(valid), env(kv, db), ctx);
   await ctx.settle();
   console.error = realError;
-  check("a lost counter write is logged rather than swallowed",
-        errors.some((e) => e.startsWith("kv write failed (day counter)")), errors.join("|"));
+  check("D1 unavailable: the question is answered (counters fail open)", r.status === 200);
+  check("a lost counter read and write are logged rather than swallowed",
+        errors.includes("counters unreadable, question allowed (D1Error)") && errors.includes("counter write failed (question counters): D1Error"), errors.join("|"));
   check("and the report names no token and no request content",
         !errors.join("|").includes(goodToken));
+}
+
+console.log("the counters in D1, read while Anthropic works (2026-10-29, option A):");
+{
+  const realFetch = globalThis.fetch;
+  const hour = new Date().toISOString().slice(0, 13);
+  // Upstream and D1 each take 150 ms. In parallel the head comes in ~150, in series ~300.
+  {
+    const kv = makeKV({ [`token:${goodToken}`]: account() });
+    const db = withCounters();
+    const order = [];
+    const batch = db.batch;
+    db.batch = async (statements) => { order.push("d1 start"); await new Promise((r) => setTimeout(r, 150)); order.push("d1 end"); return batch(statements); };
+    globalThis.fetch = async () => { order.push("upstream start"); await new Promise((r) => setTimeout(r, 150)); return new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 }); };
+    const started = Date.now();
+    const r = await send(env(kv, db));
+    const elapsed = Date.now() - started;
+    check("the upstream request starts before the counters are read", order[0] === "upstream start" && order[1] === "d1 start", order.join(","));
+    check("so the D1 read adds no wait to the head (150 ms each, in parallel)", r.status === 200 && elapsed < 260, `${elapsed}ms`);
+    const timing = r.headers.get("server-timing") || "";
+    check("server-timing reports d1 beside upstream, and the head", /d1;dur=1[4-9]\d/.test(timing) && /head;dur=\d+/.test(timing), timing);
+  }
+  // The last question under the cap writes the marker; the next never reaches Anthropic.
+  {
+    const kv = makeKV({ [`token:${goodToken}`]: account({ hourlyCap: 2, dailyCap: 100 }) });
+    const db = withCounters();
+    let upstreamCalls = 0;
+    globalThis.fetch = async () => { upstreamCalls++; return new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 }); };
+    await send(env(kv, db));
+    check("a question under the cap writes no marker", !kv.store.has(`cap:${goodToken}`));
+    await send(env(kv, db));
+    const marker = JSON.parse(kv.store.get(`cap:${goodToken}`) || "null");
+    check("the last allowed question writes the marker, with its window's end",
+          marker && marker.code === "hourly_limit" && marker.hour === 2 && marker.until === Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate(), new Date().getUTCHours() + 1));
+    const batches = []; const batch = db.batch; db.batch = async (st) => { batches.push(st.length); return batch(st); };
+    const third = await send(env(kv, db));
+    const body = await third.json();
+    check("over the cap: refused from the marker, before Anthropic and before D1",
+          third.status === 429 && body.error === "hourly_limit" && typeof body.retryAfter === "number" && upstreamCalls === 2 && batches.length === 0, `${third.status} ${upstreamCalls} ${batches.length}`);
+    check("and the refusal still carries the counts", /hour=2;hour-cap=2/.test(third.headers.get("otto-usage") || ""));
+    check("the refusal wrote nothing more", db.count(goodToken, `h:${hour}`) === 2);
+  }
+  // No marker (another location had not seen it): D1 refuses, the upstream request is aborted and the marker written.
+  {
+    const kv = makeKV({ [`token:${goodToken}`]: account({ hourlyCap: 1 }) });
+    const db = withCounters();
+    db.counters.set(`${goodToken}|h:${hour}`, { n: 1, expires_at: Date.now() + 60_000 });
+    let signal = null;
+    globalThis.fetch = (url, init) => { signal = init.signal; return new Promise((resolve, reject) => { init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }))); }); };
+    const realLog = console.log; console.log = () => {};
+    const r = await send(env(kv, db));
+    console.log = realLog;
+    check("D1 over the cap without a marker: refused, and the upstream request aborted",
+          r.status === 429 && signal && signal.aborted, `${r.status} ${signal && signal.aborted}`);
+    check("and the marker written for the next attempt", JSON.parse(kv.store.get(`cap:${goodToken}`) || "{}").code === "hourly_limit");
+  }
+  // A marker past its window, or below the cap the account now has, is ignored.
+  {
+    globalThis.fetch = async () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
+    const past = makeKV({ [`token:${goodToken}`]: account({ hourlyCap: 2 }), [`cap:${goodToken}`]: JSON.stringify({ code: "hourly_limit", until: Date.now() - 1000, day: 2, hour: 2, total: 0 }) });
+    check("a marker past its window is ignored", (await send(env(past))).status === 200);
+    const raised = makeKV({ [`token:${goodToken}`]: account({ hourlyCap: 60, dailyCap: 500 }), [`cap:${goodToken}`]: JSON.stringify({ code: "daily_limit", until: Date.now() + 3_600_000, day: 50, hour: 20, total: 0 }) });
+    check("a marker below the cap the account now has is ignored (a raised plan)", (await send(env(raised))).status === 200);
+    const garbage = makeKV({ [`token:${goodToken}`]: account(), [`cap:${goodToken}`]: "{not json" });
+    check("an unreadable marker is ignored", (await send(env(garbage))).status === 200);
+  }
+  // A trial's total from before the move seeds its D1 row; an exhausted one is refused and marked for good.
+  {
+    const trial = "trial-xyz";
+    const record = JSON.stringify({ v: 2, subject: trial, kind: "trial", plan: "trial", active: true, dailyCap: 10, hourlyCap: 10, trialCap: 10 });
+    const kv = makeKV({ [`token:${trial}`]: record, [`u:${trial}:total`]: "7" });
+    const db = withCounters();
+    const r = await send(env(kv, db), valid, trial);
+    check("a trial's KV total from before the move carries over (7 spent: the next is the 8th)",
+          r.status === 200 && db.count(trial, "total") === 8 && /trial=8;trial-cap=10/.test(r.headers.get("otto-usage") || ""), r.headers.get("otto-usage"));
+    await send(env(kv, db), valid, trial);
+    await send(env(kv, db), valid, trial);
+    const marker = JSON.parse(kv.store.get(`cap:${trial}`) || "null");
+    check("the tenth trial question marks the trial exhausted, with no expiry", marker && marker.code === "trial_exhausted" && marker.until === 0 && db.count(trial, "total") === 10);
+    const over = await send(env(kv, db), valid, trial);
+    check("and the eleventh is refused from the marker", over.status === 403 && (await over.json()).error === "trial_exhausted");
+    const spent = makeKV({ [`token:${trial}`]: record, [`u:${trial}:total`]: "10" });
+    const realLog = console.log; console.log = () => {};
+    const old = await send(env(spent, withCounters()), valid, trial);
+    console.log = realLog;
+    check("a trial exhausted before the move is still exhausted", old.status === 403);
+  }
+  // The hourly cleanup removes ended windows and keeps the trial's lifetime count.
+  {
+    const db = withCounters();
+    db.counters.set("a|h:old", { n: 3, expires_at: Date.now() - 1 });
+    db.counters.set("a|d:today", { n: 3, expires_at: Date.now() + 3_600_000 });
+    db.counters.set("a|total", { n: 4, expires_at: null });
+    const ctx = makeCtx();
+    const realLog = console.log; console.log = () => {};
+    await worker.scheduled({ cron: "0 * * * *" }, { DB: db, OTTO: makeKV() }, ctx);
+    await ctx.settle();
+    console.log = realLog;
+    check("the hourly cleanup deletes ended windows and keeps the rest", !db.counters.has("a|h:old") && db.counters.has("a|d:today") && db.counters.has("a|total"));
+  }
+  globalThis.fetch = realFetch;
 }
 
 console.log("a leaked token is not a general Anthropic proxy:");
@@ -781,7 +950,7 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
   };
   const anthropicEmpty = () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
 
-  const envTools = { ...env(kv), DB: db, COMPOSIO_API_KEY: ["ak", "TESTKEY-not-real"].join("_"),
+  const envTools = { ...env(kv), DB: withCounters(db), COMPOSIO_API_KEY: ["ak", "TESTKEY-not-real"].join("_"),
                      COMPOSIO_WEBHOOK_SECRET: "whsec-test-secret",
                      COMPOSIO_AUTH_CONFIG_GMAIL: "ac_gmail", COMPOSIO_AUTH_CONFIG_GCAL: "ac_gcal", COMPOSIO_AUTH_CONFIG_SLACK: "ac_slack",
                      COMPOSIO_AUTH_CONFIG_GITHUB: "ac_github", COMPOSIO_AUTH_CONFIG_JIRA: "ac_jira", COMPOSIO_AUTH_CONFIG_LINEAR: "ac_linear" };
@@ -874,7 +1043,7 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
     const stored = [...kv.store.entries()].map(([k, v]) => k + "=" + v).join("\n");
     check("nothing of the arguments or the result reaches KV", !stored.includes("alice") && !stored.includes("SECRETWORD"));
     check("nothing of the arguments or the result reaches the log", !logged.join("\n").includes("alice") && !logged.join("\n").includes("SECRETWORD"));
-    check("the tool counter was written for the day", [...kv.store.keys()].some((k) => k.startsWith(`u:${accountId}:t:`)));
+    check("the tool counter was written for the day, in D1", db.count(accountId, `t:${new Date().toISOString().slice(0, 10)}`) > 0 && ![...kv.store.keys()].some((k) => k.startsWith(`u:${accountId}:t:`)));
 
     // The cap: the plan allows two a day; the third is refused before Composio.
     const before = calls.length;
@@ -882,7 +1051,7 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
     const third = await post("/v1/tool", deviceToken, { tool: "gmail_search", input: {}, now: "2026-09-14T09:00:00Z", tz: "UTC" });
     check("the plan's tool cap refuses the call past it", third.status === 429 && (await third.json()).error === "tool_limit");
     check("a refused call never reaches Composio", calls.length === before + 1);
-    kv.store.delete([...kv.store.keys()].find((k) => k.startsWith(`u:${accountId}:t:`)));
+    for (const k of [...db.counters.keys()]) if (k.startsWith(`${accountId}|t:`)) db.counters.delete(k);
   }
 
   // A lapsed authorization: the row is marked and Otto is told to sign in again.
@@ -901,7 +1070,7 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
     // data.status_code — a number — and never from the free-text error.
     // FAILING EDIT: derive `reason` from /not found/i on reply.json.error.
     // (The test plan caps tool calls at two a day; the counter is cleared.)
-    for (const k of [...kv.store.keys()]) if (k.startsWith(`u:${accountId}:t:`)) kv.store.delete(k);
+    for (const k of [...db.counters.keys()]) if (k.startsWith(`${accountId}|t:`)) db.counters.delete(k);
     composioScript = { "POST /tools/execute/GMAIL_SEND_EMAIL": async () => ({ status: 200, json: { successful: false,
       error: "Repository not found: 'x/y' does not exist", data: { status_code: 404, message: "Not Found" } } }) };
     const nf = await post("/v1/tool", deviceToken, { tool: "gmail_send", input: { to: "bob@example.com", subject: "Hi", body: "Hello" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
@@ -1007,7 +1176,7 @@ console.log("connected apps (A76): a tool call, connect, callback, webhook — n
 
     // A tool on it: the default fills the owner; a missing default is needs_detail.
     // (The earlier block left the day's tool counter at the test plan's cap.)
-    for (const k of [...kv.store.keys()]) if (k.startsWith(`u:${accountId}:t:`)) kv.store.delete(k);
+    for (const k of [...db.counters.keys()]) if (k.startsWith(`${accountId}|t:`)) db.counters.delete(k);
     composioScript = { "POST /tools/execute/GITHUB_CREATE_AN_ISSUE": async () => ({ status: 200, json: { successful: true, data: { number: 42, html_url: "https://github.com/octocat/otto/issues/42" } } }) };
     const issue = await post("/v1/tool", deviceToken, { tool: "github_create_issue", input: { repo: "otto", title: "Login button dead on Safari" }, now: "2026-09-14T09:00:00Z", tz: "UTC" });
     const issueJson = await issue.json();
@@ -1064,7 +1233,8 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
 
   // A D1 stand-in with a tasks table. One UPDATE shape to parse:
   // `UPDATE tasks SET a = ?, b = ? WHERE id = ? AND account_id = ?`.
-  const makeTaskDB = () => {
+  const makeTaskDB = (...a) => withCounters(makeTaskDBBase(...a));
+  const makeTaskDBBase = () => {
     const tasks = [];
     const calls = [];
     const failures = { stepsWrites: 0, skip: 0 };   // throw on the next `stepsWrites` steps writes, after skipping `skip`
@@ -1090,6 +1260,14 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
             return null;
           },
           all: async () => {
+            // The question path's read (summaryQuery): no seen ending, nothing past retention, the sentence and host alone.
+            if (q.startsWith("SELECT id, type, state, question, reason, seen_at, updated_at, json_extract(result, '$.spoken') AS spoken, json_extract(input, '$.host') AS host FROM tasks WHERE account_id = ? AND (expires_at IS NULL OR expires_at >= ?) AND NOT (seen_at IS NOT NULL AND state IN ('succeeded', 'failed', 'cancelled', 'expired'))")) {
+              const json = (v) => { try { return JSON.parse(v); } catch { return null; } };
+              return { results: tasks.filter((t) => t.account_id === args[0] && (t.expires_at == null || t.expires_at >= args[1])
+                                              && !(t.seen_at != null && ["succeeded", "failed", "cancelled", "expired"].includes(t.state)))
+                .map((t) => ({ id: t.id, type: t.type, state: t.state, question: t.question, reason: t.reason, seen_at: t.seen_at, updated_at: t.updated_at,
+                               spoken: (json(t.result) || {}).spoken ?? null, host: (json(t.input) || {}).host ?? null })) };
+            }
             if (q.startsWith("SELECT * FROM tasks WHERE account_id = ?")) {
               return { results: tasks.filter((t) => t.account_id === args[0]).sort((a, b) => b.updated_at - a.updated_at).map((t) => ({ ...t })) };
             }
@@ -1259,8 +1437,10 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify(body) }), envTasks, makeCtx());
   const header = (response) => response.headers.get("otto-tasks") || "";
-  const clearCounter = () => { for (const k of [...kv.store.keys()]) if (k.startsWith(`u:${accountId}:k:`)) kv.store.delete(k); };
+  const clearCounter = () => { for (const k of [...db.counters.keys()]) if (k.startsWith(`${accountId}|k:`)) db.counters.delete(k); };
   const SECRET = "SECRETWORD";
+  // The summary as the question path reads it (from D1 since 2026-10-29): its own statement, through the stand-in.
+  const d1Summary = async () => summaryFromRows((await summaryQuery(envTasks, accountId, Date.now()).all()).results);
   const goodBody = { type: "research", request: `How do Swift actors handle reentrancy ${SECRET}`, context: "Xcode · Brain.swift", now: "2026-10-11T09:00:00Z", tz: "Asia/Kolkata" };
   const runWorkflow = async (id, step) => {
     const created = tasks.created.find((c) => c.id === id);
@@ -1311,13 +1491,13 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     }
     // Back to the one create r1 counted, as the block below expects.
     clearCounter();
-    kv.store.set([...kv.store.keys()].find((k) => k.startsWith(`u:${accountId}:k:`)) || `u:${accountId}:k:${new Date().toISOString().slice(0, 10)}`, "1");
+    db.counters.set(`${accountId}|k:${new Date().toISOString().slice(0, 10)}`, { n: 1, expires_at: Date.now() + 86_400_000 });
     const created = tasks.created[0];
     check("the instance was created with the row's id, the params and the row's retention",
           created && created.id === j1.id && created.params.type === "research" && created.params.accountId === accountId
           && created.params.input.request === goodBody.request && created.params.taskVersion === TASK_VERSION
           && created.retention.successRetention === "3 days" && created.retention.errorRetention === "3 days");
-    check("the day counter was written before the create", [...kv.store.keys()].some((k) => k.startsWith(`u:${accountId}:k:`)) && kv.store.get([...kv.store.keys()].find((k) => k.startsWith(`u:${accountId}:k:`))) === "1");
+    check("the day counter was written before the create, in D1", db.count(accountId, `k:${new Date().toISOString().slice(0, 10)}`) === 1 && ![...kv.store.keys()].some((k) => k.startsWith(`u:${accountId}:k:`)));
     check("the reply's header lists the new task as created", header(r1) === `v=1;running=1;awaiting=0;unseen=0;t=${j1.id}:created:research`, header(r1));
 
     await post("/v1/tasks/create", deviceToken, goodBody);
@@ -1385,8 +1565,8 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     check("findings longer than 4,096 characters are cut before the draft reads them",
           modelCalls[4].body.messages[0].content.includes("A hop is a suspension point " + "L".repeat(4096 - 28)) && !modelCalls[4].body.messages[0].content.includes("L".repeat(4096 - 27)));
     check("every call was on claude-sonnet-5 with the key as x-api-key", modelCalls.every((c) => c.body.model === "claude-sonnet-5" && c.headers["x-api-key"] === envTasks.ANTHROPIC_API_KEY));
-    const summary = JSON.parse(kv.store.get(`tasks:${accountId}`));
-    check("the KV summary now has one unseen result with its sentence", summary.unseen.length === 1 && summary.unseen[0].id === taskId && summary.unseen[0].s === result.spoken && summary.running.length === 0);
+    const summary = await d1Summary();
+    check("the question's summary now has one unseen result with its sentence", summary.unseen.length === 1 && summary.unseen[0].id === taskId && summary.unseen[0].s === result.spoken && summary.running.length === 0);
     check("the console carried no word of the request, the findings or the draft", !logged.join("|").includes(SECRET), logged.join("|").slice(0, 200));
     check("and neither did KV beyond the one spoken sentence", ![...kv.store.values()].join("|").includes(SECRET));
     check("the result's detail is in the row, not in the summary", !JSON.stringify(summary).includes("# Answer"));
@@ -1454,7 +1634,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
           modelCalls.length === 1 && step.calls.map((c) => c.name).join(",") === "start,plan,search-1,finish-failed" && !step.calls.some((c) => c.retry));
     const steps = JSON.parse(row.steps);
     check("the ledger marks search-1 failed by class and keeps the plan", steps.some((s) => s.name === "search-1" && s.outcome === "failed" && s.error === "NonRetryableError") && steps.some((s) => s.name === "plan" && s.outcome === "ok"));
-    check("the summary carries the fixed ran-out-of-time sentence", JSON.parse(kv.store.get(`tasks:${accountId}`)).unseen.some((u) => u.id === id && u.s === "The research ran out of time."));
+    check("the summary carries the fixed ran-out-of-time sentence", (await d1Summary()).unseen.some((u) => u.id === id && u.s === "The research ran out of time."));
     check("and the log carried the reason word and the step, not the words", logged.some((l) => l === "task research step search-1 failed: NonRetryableError") && logged.some((l) => l === "task research ended failed: max_duration") && !logged.join("|").includes(SECRET));
   }
 
@@ -1495,7 +1675,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
       payload: { decision: "approve" },
       before: async () => {
         rowWhileWaiting = { ...db.tasks.find((t) => t.id === id) };
-        summaryWhileWaiting = JSON.parse(kv.store.get(`tasks:${accountId}`));
+        summaryWhileWaiting = await d1Summary();
         advance(2 * HOUR + 58 * MIN);
         approveReply = await post("/v1/tasks/approve", deviceToken, { id, decision: "approve" });
       },
@@ -1581,7 +1761,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     const row = db.tasks.find((t) => t.id === id);
     check("declined ends cancelled with reason declined and no search was made", row.state === "cancelled" && row.reason === "declined" && modelCalls.length === 1);
     check("the user's own decline is already seen: the row carries seen_at and the summary does not list it unseen",
-          row.seen_at != null && !JSON.parse(kv.store.get(`tasks:${accountId}`)).unseen.some((u) => u.id === id));
+          row.seen_at != null && !(await d1Summary()).unseen.some((u) => u.id === id));
     check("and the fixed sentence still exists for a decline that reaches a summary unseen", endedSentence("research", "cancelled", "declined") === "The research stopped because you said no.");
   }
 
@@ -1692,32 +1872,40 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     const waits = [];
     await worker.scheduled({ cron: "0 4 * * *" }, envTasks, { waitUntil: (p) => waits.push(p) });
     await Promise.all(waits);
-    check("the worker's scheduled handler runs it", waits.length === 1);
+    check("the worker's scheduled handler runs it, and the counters' cleanup beside it", waits.length === 2);
     const toml = readFileSync(new URL("./wrangler.toml", import.meta.url), "utf8");
-    check("wrangler.toml schedules it once a day", /\[triggers\]\s*\ncrons = \["0 4 \* \* \*"\]/.test(toml));
+    check("wrangler.toml schedules it every hour", /\[triggers\]\s*\ncrons = \["0 \* \* \* \*"\]/.test(toml));
   }
 
-  // --- the question path: a header from KV, read beside the counters, never written
+  // --- the question path: a header from D1's rows, read in the counters' batch, never written (2026-10-29)
   {
-    const reads = [];
-    const kvSpy = { ...kv, get: async (k) => { reads.push(k); return kv.get(k); } };
-    const before = [...kv.store.keys()].filter((k) => k.startsWith("tasks:")).map((k) => kv.store.get(k)).join("|");
-    const dbCalls = db.calls.length;
+    const reads = [], puts = [];
+    const kvSpy = { ...kv, get: async (k) => { reads.push(k); return kv.get(k); }, put: async (k, v, o) => { puts.push(k); return kv.put(k, v, o); } };
+    const batches = [];
+    const realBatch = db.batch;
+    db.batch = async (statements) => { batches.push(statements.length); return realBatch(statements); };
+    const dbCalls = db.calls.length, workflowCalls = tasks.log.length, rowsBefore = JSON.stringify(db.tasks);
     const ctx = makeCtx();
     const response = await worker.fetch(ask(valid, deviceToken), { ...envTasks, OTTO: kvSpy }, ctx);
     await ctx.settle();
     const h = header(response);
-    check("a question's reply carries otto-tasks from the KV summary", response.status === 200 && h.startsWith("v=1;") && /unseen=[1-9]/.test(h) && h.includes(";s="), h);
-    const tasksRead = reads.indexOf(`tasks:${accountId}`);
-    const firstCounter = reads.findIndex((k) => k.startsWith(`u:${accountId}:`));
-    check("the summary was read in the same round trip as the counters", tasksRead >= 0 && firstCounter >= 0 && Math.abs(tasksRead - firstCounter) <= 2);
-    check("a question never writes the summary, never reads D1 and never touches the Workflow binding",
-          [...kv.store.keys()].filter((k) => k.startsWith("tasks:")).map((k) => kv.store.get(k)).join("|") === before && db.calls.length === dbCalls);
-    kv.store.delete(`tasks:${accountId}`);
+    check("a question's reply carries otto-tasks from the account's rows", response.status === 200 && h.startsWith("v=1;") && /unseen=[1-9]/.test(h) && h.includes(";s="), h);
+    check("the rows were read in the same batch as the counters, one round trip", batches.length === 1 && batches[0] === 2, JSON.stringify(batches));
+    const questionCalls = db.calls.slice(dbCalls);
+    check("a question reads the task rows with the summary's own statement and writes none",
+          questionCalls.length === 1 && questionCalls[0].startsWith("SELECT id, type, state, question") && JSON.stringify(db.tasks) === rowsBefore, JSON.stringify(questionCalls));
+    check("and never touches the Workflow binding", tasks.log.length === workflowCalls);
+    check("KV: the token and the cap marker read, nothing written under the cap",
+          JSON.stringify(reads) === JSON.stringify([`token:${deviceToken}`, `cap:${accountId}`]) && puts.length === 0, JSON.stringify(reads) + JSON.stringify(puts));
+    db.batch = async () => { throw Object.assign(new Error("d1 unavailable"), { name: "D1Error" }); };
+    const realError = console.error; console.error = () => {};
     const bare = await worker.fetch(ask(valid, deviceToken), envTasks, makeCtx());
-    check("with no summary in KV the header is absent, not zero", bare.headers.get("otto-tasks") === null);
+    console.error = realError;
+    check("with D1 unreadable the question is answered and the header is absent, not zero", bare.status === 200 && bare.headers.get("otto-tasks") === null);
+    db.batch = realBatch;
+    const trialCalls = db.calls.length;
     const trial = await worker.fetch(ask(valid, trialToken), envTasks, makeCtx());
-    check("a trial's question reads no summary", !reads.some((k) => k === `tasks:${trialToken}`) && trial.status === 200);
+    check("a trial's question reads no task rows", db.calls.length === trialCalls && trial.status === 200 && trial.headers.get("otto-tasks") === null);
   }
 
   // --- the feed (A84): a snapshot, then the platform's events, projected
@@ -2093,13 +2281,16 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
         return r;
       };
       const day = new Date(clock).toISOString().slice(0, 10);
-      const stepKey = `u:${accountId}:s:${day}`, questionKey = `u:${accountId}:d:${new Date().toISOString().slice(0, 10)}`;
-      const clearSteps = () => kv.store.delete(stepKey);
+      // The counters are D1 rows since 2026-10-29: the step's and the question's buckets for the day.
+      const stepKey = `${accountId}|s:${day}`, questionKey = `${accountId}|d:${new Date().toISOString().slice(0, 10)}`;
+      const countOf = (key) => (db.counters.get(key) || {}).n;
+      const setCount = (key, n) => db.counters.set(key, { n, expires_at: Date.now() + 86_400_000 });
+      const clearSteps = () => db.counters.delete(stepKey);
       clearSteps();
 
       const { j: jCall } = await create();
       const callId = jCall.id;
-      const questionsBefore = kv.store.get(questionKey);
+      const questionsBefore = countOf(questionKey);
       const upstreamBefore = streamCalls.length;
       const a1 = await askStep(deviceToken, callId, 1);
       const sent1 = streamCalls[streamCalls.length - 1];
@@ -2108,7 +2299,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
             && sent1.headers["x-api-key"] === envTasks.ANTHROPIC_API_KEY);
       check("the body is passed on untouched", JSON.stringify(sent1.body) === JSON.stringify(stepModelBody));
       check("it is counted on the task's row and on the day's step counter, not the question counter",
-            rowOf(callId).calls === 1 && kv.store.get(stepKey) === "1" && kv.store.get(questionKey) === questionsBefore);
+            rowOf(callId).calls === 1 && countOf(stepKey) === 1 && countOf(questionKey) === questionsBefore);
       check("its D1 round is reported in server-timing, every call", /(^|, )d1;dur=\d+/.test(a1.headers.get("server-timing") || ""));
       check("and the page sent to the model is never in the ledger",
             !rowOf(callId).steps.includes(PAGE) && !rowOf(callId).input.includes(PAGE) && !logged.join("|").includes(PAGE));
@@ -2159,7 +2350,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
       const longCall = await askStep(deviceToken, jLong.id, 1);
       check("a call past thirty minutes of working time ends the task", longCall.status === 409 && rowOf(jLong.id).reason === "max_duration");
       const { j: jCap } = await create();
-      kv.store.set(stepKey, "4");
+      setCount(stepKey, 4);
       const capped = await askStep(deviceToken, jCap.id, 1);
       const cappedBody = await capped.json();
       check("the day's step_cap refuses the next call with 429 and ends the task",
@@ -2173,7 +2364,7 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
       plans.free.step_cap = capBefore;
 
       // NOT A WAY ROUND THE QUESTION CAP
-      kv.store.set(questionKey, "50");
+      setCount(questionKey, 50);
       const qCapped = await worker.fetch(new Request("https://w/v1/ask", { method: "POST",
         headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" },
         body: JSON.stringify({ ...stepModelBody, model: "claude-sonnet-5" }) }), envTasks, makeCtx());
@@ -2181,12 +2372,13 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
       const dodgeOld = await askStep(deviceToken, jEnd.id, 1, { ...stepModelBody, model: "claude-sonnet-5" });
       check("with the question cap reached, the step route is no way round it: no task, or a finished one, is refused",
             qCapped.status === 429 && dodge.status === 400 && dodgeOld.status === 409);
-      const stepsBefore = kv.store.get(stepKey);
+      const stepsBefore = countOf(stepKey);
       const qOk = await worker.fetch(new Request("https://w/v1/ask", { method: "POST",
         headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" },
         body: JSON.stringify({ ...stepModelBody, model: "claude-sonnet-5" }) }), envTasks, makeCtx());
-      check("and a question never touches the step counter", kv.store.get(stepKey) === stepsBefore && qOk.status === 429);
-      kv.store.delete(questionKey);
+      check("and a question never touches the step counter", countOf(stepKey) === stepsBefore && qOk.status === 429);
+      db.counters.delete(questionKey);
+      kv.store.delete(`cap:${accountId}`);
       clearSteps();
     }
 

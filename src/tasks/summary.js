@@ -1,9 +1,10 @@
 /**
- * The `otto-tasks` header and the KV summary it is composed from (SPEC.md
+ * The `otto-tasks` header and the summary it is composed from (SPEC.md
  * A82). PURE: no bindings, no fetch, no logging. ONE COMPOSER FOR EVERY
- * SENDER — the six task routes, /v1/tool and /v1/integrations (from D1) and
- * the question path (from the KV copy) all call tasksHeader(); two
- * compositions of one header would drift the day one gained a field.
+ * SENDER — the six task routes, /v1/tool, /v1/integrations and the question
+ * path, all from D1 since 2026-10-29 (the question's KV copy is gone), call
+ * tasksHeader(); two compositions of one header would drift the day one
+ * gained a field.
  *
  * Grammar: fields `;`-separated, `key=value`, parts `:`-joined, sentences
  * percent-encoded and cut at 240 characters before encoding.
@@ -11,8 +12,9 @@
  *   otto-tasks: v=1;running=1;awaiting=1;unseen=2;t=<id>:<state>:<type>;…;q=<id>:<sentence>;s=<id>:<sentence>
  *
  * ABSENT MEANS NO INFORMATION. PRESENT WITH ZEROS MEANS NONE. On tool, panel
- * and task replies it is always present; on the question reply only when the
- * KV key exists, and the app must not read absence as "no tasks".
+ * and task replies it is always present; on the question reply whenever its
+ * D1 read succeeded (never for a trial), and the app must not read absence
+ * as "no tasks".
  */
 export const SUMMARY_VERSION = 1;
 export const TERMINAL = new Set(["succeeded", "failed", "cancelled", "expired"]);
@@ -58,8 +60,8 @@ function browserEnded(state, reason, host) {
 }
 
 /**
- * The KV summary, a PROJECTION of the account's rows — recomputed whole on
- * every transition, never incremented, so two writers cannot drift it.
+ * The summary, a PROJECTION of the account's rows — recomputed whole from
+ * them on every read, never stored, so nothing can drift it.
  */
 export function summaryFromRows(rows, now = Date.now()) {
   const sorted = (rows || []).slice().sort((a, b) => (Number(b.updated_at) || 0) - (Number(a.updated_at) || 0));
@@ -70,8 +72,9 @@ export function summaryFromRows(rows, now = Date.now()) {
       awaiting.push({ id: row.id, type: row.type, q: cut(question.spoken), until: Number(question.until) || 0 });
     } else if (TERMINAL.has(row.state)) {
       if (row.seen_at == null) {
-        const result = parse(row.result) || {};
-        const host = row.type === "browser" ? (parse(row.input) || {}).host || "" : "";
+        // The question path's rows carry `spoken` and `host` alone (summaryQuery); every other reader's carry the columns.
+        const result = row.spoken !== undefined ? { spoken: row.spoken } : parse(row.result) || {};
+        const host = row.type === "browser" ? (row.host !== undefined ? row.host : (parse(row.input) || {}).host) || "" : "";
         const spoken = row.state === "succeeded" && result.spoken ? result.spoken : endedSentence(row.type, row.state, row.reason, host);
         unseen.push({ id: row.id, type: row.type, state: row.state, s: cut(spoken) });
       }

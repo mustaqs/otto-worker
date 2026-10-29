@@ -52,15 +52,17 @@ is a comment.)
 record; the next request is refused. No redeploy, no effect on anyone else.
 
 **It retains nothing.** No request or response content is read into a log, an
-error body, or KV. The only things written are per-user counters.
+error body, KV or D1. The only things a question writes are per-user counters
+(D1 rows since 2026-10-29) and, when an account reaches a cap, one "capped
+until" marker in KV.
 
 **It tells you your own usage, without a second request.** Every response —
 including a 429 refusal — carries an `otto-usage` header:
 
     otto-usage: day=12;day-cap=50;hour=3;hour-cap=10;day-resets=21600;hour-resets=1180
 
-Every number was already read by `checkLimits` before the upstream call, so
-this adds no KV read, no endpoint and no state. It rides on the response head,
+Every number was already read by `checkLimits` while the upstream call ran, so
+this adds no read, no endpoint and no state. It rides on the response head,
 which Workers emit as soon as the upstream headers arrive, so the app has the
 numbers at time-to-first-token rather than at the end of the answer.
 
@@ -73,19 +75,21 @@ hour. A display saying "today" would be wrong for a third of the day for anyone
 west of Greenwich; "resets in 6h" is true everywhere, and no timezone has to
 exist anywhere in the system.
 
-**Brace the variables in KV key commands.** The counter keys look like
-`u:<token>:h:<YYYY-MM-DDTHH>`, and in zsh — macOS's default shell — `:h` is a
-parameter expansion modifier meaning "head of path". So `"u:$TOKEN:h:$HOUR"`
-expands `$TOKEN:h` to `.` and the command **silently reads, writes or deletes the
-wrong key while appearing to succeed**. Always brace:
+**The counters are D1 rows (2026-10-29).** Workers KV's free plan allows 1,000
+writes a day and every question wrote two, so they moved to the `counters`
+table (migrations/0007): one row per account and window, `d:<YYYY-MM-DD>`,
+`h:<YYYY-MM-DDTHH>`, `total` for a trial, and `t:`/`k:`/`s:` days for tools,
+tasks and browser steps. The question reads them in one batch with the task
+rows WHILE the upstream request runs, so the ~100 ms D1 round trip adds no
+wait; over a cap the upstream request is aborted. The last question under a
+cap writes `cap:<subject>` to KV, read beside the token, so later attempts are
+refused before anything is spent. To set a count by hand:
 
-    TOKEN=beta-abc
     HOUR=$(date -u +%Y-%m-%dT%H)
-    wrangler kv key put --remote --binding=OTTO "u:${TOKEN}:h:${HOUR}" 999
-    wrangler kv key delete --remote --binding=OTTO "u:${TOKEN}:h:${HOUR}"
+    wrangler d1 execute otto --remote --command "INSERT INTO counters VALUES ('beta-abc', 'h:${HOUR}', 999, (unixepoch() + 3600) * 1000) ON CONFLICT DO UPDATE SET n = 999"
 
-The daily key `u:${TOKEN}:d:${DAY}` is safe by luck — `:d` is not a modifier —
-but brace it too rather than relying on which letters zsh happens to claim.
+and to clear a marker, `wrangler kv key delete --remote --binding=OTTO "cap:beta-abc"`.
+An hourly cron deletes windows that have ended.
 
 **Changes to KV are not visible for up to a minute.** Reads are edge-cached with
 a `cacheTtl` default of 60 seconds, which is also the minimum settable value, so
