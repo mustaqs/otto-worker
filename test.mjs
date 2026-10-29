@@ -2024,6 +2024,11 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
           && rowOf(jEnd.id).state === "cancelled" && rowOf(jEnd.id).reason === "user_closed_tab" && rowOf(jEnd.id).seen_at
           && tasks.log.some((l) => l.id === jEnd.id && l.call === "terminate"));
     check("and is said as what happened", endedSentence("browser", "cancelled", "user_closed_tab") === "Stopped — you closed Otto's tab.");
+    const { j: jTyped } = await create();
+    await stepPost(deviceToken, { id: jTyped.id, n: 1, kind: "end", reason: "user_typing" });
+    check("the user typing in the tab they handed over cancels the task, seen at once, and says so (current-tab design)",
+          rowOf(jTyped.id).state === "cancelled" && rowOf(jTyped.id).seen_at
+          && endedSentence("browser", "cancelled", "user_typing") === "Stopped — you started typing in that tab, so it's yours.");
     const { j: jGone } = await create();
     await stepPost(deviceToken, { id: jGone.id, n: 1, kind: "end", reason: "browser_closed" });
     check("Chrome closing fails the task with its reason, not seen", rowOf(jGone.id).state === "failed" && !rowOf(jGone.id).seen_at
