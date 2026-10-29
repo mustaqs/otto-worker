@@ -316,7 +316,9 @@ async function registerDevice(request, env) {
     trialCap: plan.trial_cap,
   };
 
-  await env.OTTO.put(`token:${token}`, JSON.stringify(record));
+  // A TOKEN THAT CANNOT BE STORED IS NOT HANDED OUT: every later request
+  // would be refused with it. The user is told to try again instead.
+  if (!(await safePut(env, `token:${token}`, JSON.stringify(record), undefined, "device token"))) return problem(503, "not_provisioned");
 
   // KV FIRST, D1 SECOND. If D1 fails the user still has a working trial and we
   // have lost a row we can reconstruct; the other order hands out a token that
@@ -551,10 +553,10 @@ async function checkLimits(env, account, timing = {}) {
     tasks,
     commit: () =>
       Promise.all([
-        env.OTTO.put(dayKey, String(dayCount + 1), { expirationTtl: 60 * 60 * 48 }),
-        env.OTTO.put(hourKey, String(hourCount + 1), { expirationTtl: 60 * 60 * 2 }),
+        safePut(env, dayKey, String(dayCount + 1), { expirationTtl: 60 * 60 * 48 }, "day counter"),
+        safePut(env, hourKey, String(hourCount + 1), { expirationTtl: 60 * 60 * 2 }, "hour counter"),
         // No expirationTtl, deliberately. See the key's comment above.
-        ...(onTrial ? [env.OTTO.put(totalKey, String(totalCount + 1))] : []),
+        ...(onTrial ? [safePut(env, totalKey, String(totalCount + 1), undefined, "trial total")] : []),
       ]),
   };
 }
@@ -808,7 +810,9 @@ async function signInVerify(request, env) {
     hourlyCap: caps.hourly_cap,
     trialCap: caps.trial_cap,
   };
-  await env.OTTO.put(`token:${token}`, JSON.stringify(record));
+  // A TOKEN THAT CANNOT BE STORED IS NOT HANDED OUT: every later request
+  // would be refused with it. The user is told to try again instead.
+  if (!(await safePut(env, `token:${token}`, JSON.stringify(record), undefined, "device token"))) return problem(503, "not_provisioned");
 
   const now = Date.now();
   try {
@@ -827,7 +831,7 @@ async function signInVerify(request, env) {
     try {
       const raw = await env.OTTO.get(`token:${auth.token}`);
       const old = raw ? JSON.parse(raw) : null;
-      if (old) await env.OTTO.put(`token:${auth.token}`, JSON.stringify({ ...old, active: false }));
+      if (old) await safePut(env, `token:${auth.token}`, JSON.stringify({ ...old, active: false }), undefined, "device token");
     } catch (error) {
       console.error("previous token not retired:", String(error && error.message));
     }
@@ -1010,7 +1014,7 @@ async function runTool(request, env) {
   if (!args) return problem(400, "unknown_tool", {}, headers);
 
   // Counted before the call, like questions: a failed call still counts.
-  await env.OTTO.put(toolKey, String(used + 1), { expirationTtl: 60 * 60 * 48 });
+  await safePut(env, toolKey, String(used + 1), { expirationTtl: 60 * 60 * 48 }, "tool counter");
 
   const reply = await composio(env, "POST", `/tools/execute/${spec.slug}`, {
     user_id: accountId,
@@ -1436,7 +1440,7 @@ async function createTask(request, env) {
   // the app says when in the user's own clock (A91).
   const resetsAt = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate() + 1);
   if (taskCap > 0 && used >= taskCap) return problem(429, "task_limit", { cap: taskCap, resetsAt }, await safeTasksHeader(env, accountId));
-  await env.OTTO.put(taskDayKey, String(used + 1), { expirationTtl: 60 * 60 * 48 });
+  await safePut(env, taskDayKey, String(used + 1), { expirationTtl: 60 * 60 * 48 }, "task counter");
 
   const id = crypto.randomUUID();
   const createdAt = Date.now();
@@ -1666,7 +1670,7 @@ async function askStep(request, env, ctx, t0 = Date.now()) {
   }
   // Off the critical path, as the question's increment is; the per-task
   // bound above is the exact one, this is the day's.
-  defer(ctx, env.OTTO.put(stepDayKey, String(today + 1), { expirationTtl: 60 * 60 * 48 }), "step counter increment");
+  defer(ctx, safePut(env, stepDayKey, String(today + 1), { expirationTtl: 60 * 60 * 48 }, "step counter"), "step counter increment");
 
   const beforeUpstream = Date.now();
   const upstream = await fetch(ANTHROPIC, {
@@ -1997,6 +2001,22 @@ async function upstreamRefusal(upstream, where) {
  * message carries no token and no request content: it says what failed, not for
  * whom. Visible with `wrangler tail`; observability stays off.
  */
+/**
+ * A KV WRITE NEVER FAILS A REQUEST (2026-10-29: the account passed Workers
+ * KV's free 1,000 writes a day). Logged by class and carried on: a counter
+ * that cannot be written is not incremented, so its cap fails open; a token or
+ * summary that cannot be written is read from D1 or written again next time.
+ */
+export async function safePut(env, key, value, options, what) {
+  try {
+    await env.OTTO.put(key, value, options);
+    return true;
+  } catch (error) {
+    console.error(`kv write failed (${what}): ${error && error.name ? error.name : "error"}`);
+    return false;
+  }
+}
+
 function defer(ctx, work, what) {
   const reported = Promise.resolve(work).catch((error) => {
     console.error(`deferred ${what} failed: ${error && error.message ? error.message : error}`);

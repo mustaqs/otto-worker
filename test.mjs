@@ -130,6 +130,16 @@ console.log("streaming (the one that matters):");
 
 console.log("tokens:");
 globalThis.fetch = async () => new Response(new ReadableStream({ start: (c) => c.close() }), { status: 200 });
+// KV WRITES REFUSED (2026-10-29: past Workers KV's free daily writes): a question still answers.
+{
+  const kv = makeKV({ [`token:${goodToken}`]: account() });
+  kv.put = async () => { throw new Error("KV put() limit exceeded for the day."); };
+  const realError = console.error; const logged = []; console.error = (...a) => logged.push(a.join(" "));
+  const r = await send(env(kv));
+  console.error = realError;
+  check("a question still answers when every KV write is refused, and the failure is logged by class",
+        r.status === 200 && logged.some((l) => l.startsWith("kv write failed (day counter)")) && !logged.some((l) => l.includes("limit exceeded")));
+}
 {
   const kv = makeKV({ [`token:${goodToken}`]: account() });
   check("unknown token rejected", (await worker.fetch(ask(valid, "nope"), env(kv))).status === 401);
@@ -619,7 +629,7 @@ console.log("deferring the counter write:");
   await ctx.settle();
   console.error = realError;
   check("a lost counter write is logged rather than swallowed",
-        errors.some((e) => e.includes("deferred counter increment failed")), errors.join("|"));
+        errors.some((e) => e.startsWith("kv write failed (day counter)")), errors.join("|"));
   check("and the report names no token and no request content",
         !errors.join("|").includes(goodToken));
 }
@@ -1911,6 +1921,18 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     check("its start page is kept without query or fragment, with its host",
           in1.url === "https://www.amazon.com/gp/css/order-history" && in1.host === "www.amazon.com" && !rowOf(j1.id).input.includes(QUERY), JSON.stringify(in1));
     check("a mode other than read or act is refused", (await create({ mode: "drive" })).r.status === 400);
+    // KV WRITES REFUSED: a task is created, steps, and finishes all the same (2026-10-29).
+    {
+      const realPut = kv.put;
+      kv.put = async () => { throw new Error("KV put() limit exceeded for the day."); };
+      const { r, j } = await capture(() => create());
+      const s1 = await capture(() => stepPost(deviceToken, { id: j.id, n: 1, kind: "step", label: "Opened example.com" }));
+      const fin = await capture(() => stepPost(deviceToken, { id: j.id, n: 2, kind: "finish", answer: "Done." }));
+      const list = await capture(() => post("/v1/tasks", deviceToken, {}));
+      kv.put = realPut;
+      check("with every KV write refused, a browser task is created, steps, finishes and is listed",
+            r.status === 200 && s1.status === 200 && fin.status === 200 && list.status === 200, `${r.status} ${s1.status} ${fin.status} ${list.status}`);
+    }
     check("a browser task needs an https start page",
           (await create({ url: "http://www.amazon.com/" })).r.status === 400 && (await create({ url: "javascript:alert(1)" })).r.status === 400
           && (await create({ url: undefined })).r.status === 400);
