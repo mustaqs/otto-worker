@@ -1525,7 +1525,7 @@ async function stepTask(request, env) {
   // here, as a cancel is; a stop the user made is seen at once (A82).
   if (kind === "end") {
     await terminateInstance(env, task.id);
-    const byUser = body.reason === "user_closed_tab" || body.reason === "user_stopped";
+    const byUser = body.reason === "user_closed_tab" || body.reason === "user_stopped" || body.reason === "user_typing";
     await finishTask(env, task, byUser ? "cancelled" : "failed", { reason: body.reason, seen: byUser });
     console.log(`task browser ended: ${body.reason}`);
     return json200({ id, n, state: byUser ? "cancelled" : "failed" }, await safeTasksHeader(env, task.accountId));

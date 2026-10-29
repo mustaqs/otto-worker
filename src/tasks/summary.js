@@ -34,10 +34,11 @@ export function endedSentence(type, state, reason, host = "") {
 export const BROWSER_END_REASONS = {
   user_closed_tab: "Stopped — you closed Otto's tab.",
   user_stopped: "Stopped — you pressed stop.",
+  user_typing: "Stopped — you started typing in that tab, so it's yours.",
   browser_closed: "Stopped — Chrome was closed.",
   otto_quit: "Stopped — Otto quit.",
   checkpoint: "Stopped — the site wants to check you're human, and the tab is yours.",
-  extension_missing: "Stopped — Otto's Chrome extension isn't installed or turned on in the Chrome profile you used last.",
+  extension_missing: "Stopped — the Chrome profile Otto uses isn't open, or Otto's extension is off in it.",
   gave_up: "Stopped — I couldn't do that on this site.",
 };
 function browserEnded(state, reason, host) {

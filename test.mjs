@@ -205,7 +205,7 @@ console.log("when Anthropic rejects a call (2026-10-28's outage):");
 
   const { endedSentence } = await import("./src/tasks/summary.js");
   check("a checkpoint names the site, and gives the tab back", endedSentence("browser", "failed", "checkpoint", "news.ycombinator.com") === "news.ycombinator.com wants to check you're human — the tab is yours.");
-  check("an extension missing from the profile says which profile", endedSentence("browser", "failed", "extension_missing", "x.com") === "Stopped — Otto's Chrome extension isn't installed or turned on in the Chrome profile you used last.");
+  check("an extension missing from the profile says which profile", endedSentence("browser", "failed", "extension_missing", "x.com") === "Stopped — the Chrome profile Otto uses isn't open, or Otto's extension is off in it.");
 }
 
 // ------------------------------------------------------------------- usage
@@ -2024,6 +2024,11 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
           && rowOf(jEnd.id).state === "cancelled" && rowOf(jEnd.id).reason === "user_closed_tab" && rowOf(jEnd.id).seen_at
           && tasks.log.some((l) => l.id === jEnd.id && l.call === "terminate"));
     check("and is said as what happened", endedSentence("browser", "cancelled", "user_closed_tab") === "Stopped — you closed Otto's tab.");
+    const { j: jTyped } = await create();
+    await stepPost(deviceToken, { id: jTyped.id, n: 1, kind: "end", reason: "user_typing" });
+    check("the user typing in the tab they handed over cancels the task, seen at once, and says so (current-tab design)",
+          rowOf(jTyped.id).state === "cancelled" && rowOf(jTyped.id).seen_at
+          && endedSentence("browser", "cancelled", "user_typing") === "Stopped — you started typing in that tab, so it's yours.");
     const { j: jGone } = await create();
     await stepPost(deviceToken, { id: jGone.id, n: 1, kind: "end", reason: "browser_closed" });
     check("Chrome closing fails the task with its reason, not seen", rowOf(jGone.id).state === "failed" && !rowOf(jGone.id).seen_at
