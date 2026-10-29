@@ -377,7 +377,9 @@ export async function taskRows(env, accountId, now = Date.now()) {
 export async function writeSummary(env, accountId) {
   const rows = await taskRows(env, accountId);
   const summary = summaryFromRows(rows);
-  await env.OTTO.put(`tasks:${accountId}`, JSON.stringify(summary));
+  // A failed write is logged, never thrown (2026-10-29): the summary is a copy of D1.
+  try { await env.OTTO.put(`tasks:${accountId}`, JSON.stringify(summary)); }
+  catch (error) { console.error(`kv write failed (task summary): ${error && error.name ? error.name : "error"}`); }
   return summary;
 }
 
