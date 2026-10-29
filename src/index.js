@@ -30,7 +30,7 @@ import {
 } from "./tasks/browser.js";
 import { tasksHeader, TERMINAL, BROWSER_END_REASONS } from "./tasks/summary.js";
 import {
-  insertRow, readRow, deleteRow, markState, finishTask, taskRows, writeSummary,
+  insertRow, readRow, deleteRow, purgeExpired, markState, finishTask, taskRows, writeSummary,
   tasksHeaderFor, deleteInstance, terminateInstance, appendStep, countCall,
 } from "./tasks/run.js";
 // The feed (A84): the account's tasks as server-sent events, and the one
@@ -68,6 +68,11 @@ const STEP_MODELS = new Set([
 ]);
 
 export default {
+  /** The daily cleanup (wrangler.toml's cron trigger): finished tasks past their three days. */
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(purgeExpired(env).catch((error) => console.error("task cleanup failed:", String(error && error.name || "error"))));
+  },
+
   async fetch(request, env, ctx) {
     const t0 = Date.now();
     const cold = !isolateWarm;

@@ -6,6 +6,8 @@
  * slow, and the cause would be three layers away from the symptom.
  */
 import worker, { classifyUpstream } from "./src/index.js";
+import { purgeExpired } from "./src/tasks/run.js";
+import { readFileSync } from "node:fs";
 
 let failures = 0;
 // A parked promise with nothing else pending drains node's loop and the file
@@ -1081,6 +1083,9 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
             if (q.startsWith("SELECT * FROM tasks WHERE account_id = ?")) {
               return { results: tasks.filter((t) => t.account_id === args[0]).sort((a, b) => b.updated_at - a.updated_at).map((t) => ({ ...t })) };
             }
+            if (q.startsWith("SELECT id, account_id FROM tasks WHERE state IN")) {
+              return { results: tasks.filter((t) => ["succeeded", "failed", "cancelled", "expired"].includes(t.state) && t.expires_at != null && t.expires_at < args[0]).map((t) => ({ id: t.id, account_id: t.account_id })) };
+            }
             if (q.startsWith("SELECT id, state, updated_at FROM tasks WHERE account_id = ?")) {
               return { results: tasks.filter((t) => t.account_id === args[0]).map((t) => ({ id: t.id, state: t.state, updated_at: t.updated_at })) };
             }
@@ -1661,6 +1666,25 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     await post("/v1/tasks", deviceToken, {});
     check("a non-terminal row is never swept", db.tasks.some((t) => t.id === cancelled.id));
     cancelled.state = "cancelled";
+  }
+
+  // --- retention: the daily cleanup, for every account, read or not
+  {
+    const finished = db.tasks.filter((t) => ["succeeded", "failed", "cancelled", "expired"].includes(t.state));
+    const gone = finished[0], kept = finished[1];
+    gone.expires_at = clock - 1; kept.expires_at = clock + 60_000;
+    const running = db.tasks.find((t) => !["succeeded", "failed", "cancelled", "expired"].includes(t.state));
+    if (running) running.expires_at = clock - 1;
+    const removed = await purgeExpired(envTasks, clock);
+    check("the daily cleanup deletes a finished task past its three days, and its instance, without the account reading anything",
+          removed >= 1 && !db.tasks.some((t) => t.id === gone.id) && tasks.log.some((l) => l.id === gone.id && l.call === "delete"));
+    check("and keeps one still inside them, and any task not finished", db.tasks.some((t) => t.id === kept.id) && (!running || db.tasks.some((t) => t.id === running.id)));
+    const waits = [];
+    await worker.scheduled({ cron: "0 4 * * *" }, envTasks, { waitUntil: (p) => waits.push(p) });
+    await Promise.all(waits);
+    check("the worker's scheduled handler runs it", waits.length === 1);
+    const toml = readFileSync(new URL("./wrangler.toml", import.meta.url), "utf8");
+    check("wrangler.toml schedules it once a day", /\[triggers\]\s*\ncrons = \["0 4 \* \* \*"\]/.test(toml));
   }
 
   // --- the question path: a header from KV, read beside the counters, never written

@@ -78,3 +78,9 @@ COMPOSIO_AUTH_CONFIG_JIRA = "ac_KdF-A2eDbX8N"
 COMPOSIO_AUTH_CONFIG_GDRIVE = "ac_U5sti7s4EAnX"
 COMPOSIO_AUTH_CONFIG_NOTION = "ac_AEAcmoors-ge"
 COMPOSIO_AUTH_CONFIG_LINEAR = "ac_IK7XxJ5S7TV-"
+
+# THE DAILY CLEANUP (2026-10-29): finished tasks past their three days are
+# deleted at 04:00 UTC (src/tasks/run.js purgeExpired). Cron triggers are on the
+# Workers Free plan.
+[triggers]
+crons = ["0 4 * * *"]

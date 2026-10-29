@@ -390,6 +390,26 @@ export async function tasksHeaderFor(env, accountId) {
 // -------------------------------------------------------------- instance
 
 /** Best effort: an instance already gone, or already finished, is not an error the user sees. */
+/**
+ * THE DAILY CLEANUP (2026-10-29): every account's finished task past its three
+ * days is deleted, with its Workflow instance — by Cloudflare's cron trigger
+ * once a day, so a record is gone three days after its task ends whether or
+ * not the account ever reads its tasks again. The read-time sweep in
+ * taskRows() stays: between runs, an expired row is never returned.
+ */
+export async function purgeExpired(env, now = Date.now()) {
+  const result = await env.DB.prepare(
+    `SELECT id, account_id FROM tasks WHERE state IN ('succeeded', 'failed', 'cancelled', 'expired') AND expires_at IS NOT NULL AND expires_at < ?`
+  ).bind(now).all();
+  const rows = (result && result.results) || [];
+  for (const row of rows) {
+    await deleteRow(env, { id: row.id, accountId: row.account_id });
+    await deleteInstance(env, row.id);
+  }
+  console.log(`task cleanup: ${rows.length} expired row(s) removed`);
+  return rows.length;
+}
+
 export async function deleteInstance(env, id) {
   if (!env.TASKS) return false;
   try {
