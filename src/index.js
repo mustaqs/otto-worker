@@ -316,7 +316,9 @@ async function registerDevice(request, env) {
     trialCap: plan.trial_cap,
   };
 
-  await safePut(env, `token:${token}`, JSON.stringify(record), undefined, "device token");
+  // A TOKEN THAT CANNOT BE STORED IS NOT HANDED OUT: every later request
+  // would be refused with it. The user is told to try again instead.
+  if (!(await safePut(env, `token:${token}`, JSON.stringify(record), undefined, "device token"))) return problem(503, "not_provisioned");
 
   // KV FIRST, D1 SECOND. If D1 fails the user still has a working trial and we
   // have lost a row we can reconstruct; the other order hands out a token that
@@ -808,7 +810,9 @@ async function signInVerify(request, env) {
     hourlyCap: caps.hourly_cap,
     trialCap: caps.trial_cap,
   };
-  await safePut(env, `token:${token}`, JSON.stringify(record), undefined, "device token");
+  // A TOKEN THAT CANNOT BE STORED IS NOT HANDED OUT: every later request
+  // would be refused with it. The user is told to try again instead.
+  if (!(await safePut(env, `token:${token}`, JSON.stringify(record), undefined, "device token"))) return problem(503, "not_provisioned");
 
   const now = Date.now();
   try {
