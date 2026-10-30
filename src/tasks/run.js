@@ -52,7 +52,7 @@ export async function runTask({ event, step, env, NonRetryableError }) {
     task,
     entry,
     step: (name, fn, config) => guardedStep({ step, env, task, NonRetryableError }, name, fn, config),
-    ask: (spoken, key) => askUser({ step, env, task, entry }, spoken, key),
+    ask: (spoken, key, options) => askUser({ step, env, task, entry }, spoken, key, options),
     // A89: the browser ledger's wait for "a step was posted", and the row it
     // then reads — only ever from inside a step, so a replay reads the cache.
     awaitStep: (i) => awaitStep({ step, env, task, entry }, i),
@@ -77,10 +77,13 @@ export async function runTask({ event, step, env, NonRetryableError }) {
     const reason = /\bmax_duration\b/.test(message) ? "max_duration"
       : error && error.name === "TaskDeclined" ? "declined"
       : error && error.name === "TaskExpired" ? "timeout"
+      : error && error.name === "TaskStopped" ? "stopped"
+      : error && error.name === "TaskTurnExpired" ? "turn_timeout"
       : error && error.name === "TaskIdle" ? "idle"
       : error && error.name === "TaskStepLimit" ? "step_limit"
       : "step_failed";
-    const state = reason === "declined" ? "cancelled" : reason === "timeout" || reason === "idle" ? "expired" : "failed";
+    const state = reason === "declined" || reason === "stopped" ? "cancelled"
+      : reason === "timeout" || reason === "idle" || reason === "turn_timeout" ? "expired" : "failed";
     // The reason word, never the words. The failed step named itself in the
     // ledger and the log before it threw (guardedStep, askUser): a property
     // set on the error inside step.do does not survive the engine's rethrow,
@@ -142,7 +145,10 @@ function finalStep(step, name, fn) {
  * approval timeout, records how long it waited so the clock forgives it, and
  * maps only the timeout to `expired`.
  */
-async function askUser({ step, env, task, entry }, spoken, key) {
+async function askUser({ step, env, task, entry }, spoken, key, { kind } = {}) {
+  // A TURN (A94) waits the type's turn timeout and says it is one, so the
+  // card offers Continue and Stop; Stop ends it as the user's stop.
+  const turn = kind === "turn" && !!entry.turnTimeout;
   // ONE SET OF STEP NAMES PER QUESTION. Research asks at most once and keeps
   // its names; a browser task may ask before each act, keyed by its step (A89).
   const suffix = key ? `-${key}` : "";
@@ -153,8 +159,8 @@ async function askUser({ step, env, task, entry }, spoken, key) {
   // run of 2026-10-11 recorded waited_ms 64 for a 34-minute wait and ran out.
   const asked = await step.do(`ask-write${suffix}`, { timeout: "1 minute" }, async () => {
     const askedAt = Date.now();
-    const until = askedAt + durationMs(entry.approvalTimeout);
-    await markState(env, task, "awaiting_approval", { question: { spoken: String(spoken || "").slice(0, 240), askedAt, until } });
+    const until = askedAt + durationMs(turn ? entry.turnTimeout : entry.approvalTimeout);
+    await markState(env, task, "awaiting_approval", { question: { spoken: String(spoken || "").slice(0, 240), askedAt, until, ...(turn ? { kind: "turn" } : {}) } });
     return { askedAt, until };
   });
   let event;
@@ -165,13 +171,13 @@ async function askUser({ step, env, task, entry }, spoken, key) {
     const word = expired ? "TaskExpired" : errorWord(error);
     console.error(`task ${task.type} step ask-wait failed: ${word}`);
     await recordStep(env, task, { name: `ask-wait${suffix}`, started: asked.askedAt, ended: Date.now(), outcome: "failed", error: word });
-    if (expired) throw Object.assign(new Error("timeout"), { name: "TaskExpired" });
+    if (expired) throw Object.assign(new Error("timeout"), { name: turn ? "TaskTurnExpired" : "TaskExpired" });
     throw error;
   }
   const decision = event && event.payload && event.payload.decision === "approve" ? "approve" : "decline";
   await step.do(`ask-read${suffix}`, { timeout: "1 minute" }, () =>
     markState(env, task, decision === "approve" ? "running" : "declined", { waitedMs: Date.now() - asked.askedAt }));
-  if (decision === "decline") throw Object.assign(new Error("declined"), { name: "TaskDeclined" });
+  if (decision === "decline") throw Object.assign(new Error("declined"), { name: turn ? "TaskStopped" : "TaskDeclined" });
   return decision;
 }
 

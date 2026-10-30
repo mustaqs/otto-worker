@@ -53,12 +53,14 @@ export async function runBrowser(ctx) {
     const last = view.last;
     if (!last) continue;
     if (last.kind === "finish") return { answer: last.answer || "", title: view.title };
-    if (last.kind === "approval" && last.ask && !asked.has(last.n)) {
+    if ((last.kind === "approval" || last.kind === "turn") && last.ask && !asked.has(last.n)) {
       asked.add(last.n);
       // THE EXTENSION'S SENTENCE, VERBATIM (A89 §6): built from what the
       // browser will send, never the model's words. Keyed by the step, so a
       // task may hold more than one approval and each has its own steps.
-      await ctx.ask(last.ask, `step-${last.n}`);
+      // A TURN (A94) is the same wait with its own timeout: the user signs
+      // in, types a code or answers, and Continue resumes the task.
+      await ctx.ask(last.ask, `step-${last.n}`, last.kind === "turn" ? { kind: "turn" } : {});
     }
   }
   throw Object.assign(new Error("step_limit"), { name: "TaskStepLimit" });
@@ -85,7 +87,9 @@ export function renderBrowser(out) {
 
 /** What a posted step may say (A89 §7): labels, an approval sentence, an answer. */
 export const STEP_KEYS = ["id", "n", "kind", "label", "sentence", "answer", "reason"];
-export const STEP_KINDS = ["step", "approval", "finish", "end"];
+// "turn" (A94): the user's turn — sign in, a code, a check, an answer — held
+// like an approval, answered by Continue or Stop.
+export const STEP_KINDS = ["step", "approval", "turn", "finish", "end"];
 export const STEP_BODY_MAX_BYTES = 2048;
 export const STEP_LABEL_MAX = 80;
 export const STEP_SENTENCE_MAX = 240;

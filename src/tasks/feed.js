@@ -85,7 +85,7 @@ export function projectRow(row) {
     // The name the task goes by everywhere (A91); the request cut at a word
     // boundary for a task created before titles.
     title: titleOf(input),
-    ...(question && question.spoken ? { question: { spoken: question.spoken, until: Number(question.until) || 0 } } : {}),
+    ...(question && question.spoken ? { question: { spoken: question.spoken, until: Number(question.until) || 0, ...(question.kind === "turn" ? { kind: "turn" } : {}) } } : {}),
     ...(result && result.spoken ? { spoken: result.spoken } : {}),
     ...(notes && typeof notes.title === "string" && notes.title ? { noteTitle: notes.title } : {}),
     steps,

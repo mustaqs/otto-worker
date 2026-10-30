@@ -2235,6 +2235,54 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     check("the idle wait is ten minutes, on its own event type", (await runWorkflow((await create()).j.id, idleWait), idleWait.calls.some((c) => c.name === "step-wait-1" && c.config.type === "browser-step" && c.config.timeout === "10 minutes")));
     check("an expired task refuses steps", (await stepPost(deviceToken, { id: jIdle.id, n: 1, kind: "step", label: "x" })).status === 409);
 
+    // YOUR TURN (A94): a sign-in, a code, a check or an answer, held like a
+    // yes in a task of either mode, fifteen minutes, Continue or Stop.
+    clearCounter();
+    const { j: jTurn } = await create();
+    const turnSentence = "Your turn: sign in to greenhouse.io, then press Continue.";
+    check("a turn needs its sentence", (await stepPost(deviceToken, { id: jTurn.id, n: 1, kind: "turn", label: "Your turn: sign in" })).status === 400);
+    const t1 = await stepPost(deviceToken, { id: jTurn.id, n: 1, kind: "turn", label: "Your turn: sign in", sentence: turnSentence });
+    check("a task started to look may hand the user a turn: it unlocks nothing", t1.status === 200 && JSON.parse(rowOf(jTurn.id).input).mode === "read");
+    let turnHeld = null, turnListed = null;
+    const turnStep = makeStep([
+      { payload: { n: 1 } },
+      { payload: { decision: "approve" }, before: async () => {
+          turnHeld = { ...rowOf(jTurn.id) };
+          turnListed = (await (await post("/v1/tasks", deviceToken, {})).json()).tasks.find((t) => t.id === jTurn.id);
+          await post("/v1/tasks/approve", deviceToken, { id: jTurn.id, decision: "approve" });
+          await stepPost(deviceToken, { id: jTurn.id, n: 2, kind: "finish", answer: "Signed in; the application is open." });
+        } },
+      { payload: { n: 2 } },
+    ]);
+    await runWorkflow(jTurn.id, turnStep);
+    const turnQ = turnHeld && turnHeld.question ? JSON.parse(turnHeld.question) : {};
+    check("a turn is held as a wait for the user, says it is a turn, and waits fifteen minutes",
+          turnHeld && turnHeld.state === "awaiting_approval" && turnQ.kind === "turn" && turnQ.spoken === turnSentence && turnQ.until - turnQ.askedAt === 15 * MIN, turnHeld && turnHeld.question);
+    check("the tab's projection says it is a turn", turnListed && turnListed.question && turnListed.question.kind === "turn");
+    check("Continue resumes the task to its answer", rowOf(jTurn.id).state === "succeeded");
+    clearCounter();
+    const { j: jStop } = await create();
+    await stepPost(deviceToken, { id: jStop.id, n: 1, kind: "turn", label: "Your turn: a code", sentence: "Your turn: type the code from your phone, then press Continue." });
+    await runWorkflow(jStop.id, makeStep([{ payload: { n: 1 } }, { payload: { decision: "decline" }, before: async () => { await post("/v1/tasks/approve", deviceToken, { id: jStop.id, decision: "decline" }); } }]));
+    check("Stop ends it as the user's stop, said as that", rowOf(jStop.id).state === "cancelled" && rowOf(jStop.id).reason === "stopped"
+          && endedSentence("browser", "cancelled", "stopped") === "Stopped — you pressed Stop.");
+    clearCounter();
+    const { j: jLate } = await create();
+    await stepPost(deviceToken, { id: jLate.id, n: 1, kind: "turn", label: "Your turn: a check", sentence: "Your turn: prove you're human on x.example, then press Continue." });
+    await runWorkflow(jLate.id, makeStep([{ payload: { n: 1 } }]));
+    check("a turn left fifteen minutes expires, said as that", rowOf(jLate.id).state === "expired" && rowOf(jLate.id).reason === "turn_timeout"
+          && endedSentence("browser", "expired", "turn_timeout") === "Stopped — I waited fifteen minutes for your turn.");
+    clearCounter();
+    const { j: jPlain } = await create({ mode: "act", url: "https://httpbin.org/forms/post" });
+    await stepPost(deviceToken, { id: jPlain.id, n: 1, kind: "approval", label: "Submit", sentence: "On httpbin.org: submit. Go ahead?" });
+    let plainQ = {};
+    const plainStep = makeStep([{ payload: { n: 1 } }, { payload: { decision: "decline" }, before: async () => {
+      plainQ = JSON.parse(rowOf(jPlain.id).question || "{}");
+      await post("/v1/tasks/approve", deviceToken, { id: jPlain.id, decision: "decline" }); } }]);
+    await runWorkflow(jPlain.id, plainStep);
+    check("an ordinary approval is not a turn and still waits ten minutes", !plainQ.kind && plainQ.until - plainQ.askedAt === 10 * MIN, JSON.stringify(plainQ));
+    check("and its no is still \"you said no\"", rowOf(jPlain.id).reason === "declined");
+
     // the bounds: twenty-five steps, thirty minutes
     const { j: jMany } = await create();
     let lastOk = 0;

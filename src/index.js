@@ -1552,8 +1552,8 @@ async function stepTask(request, env) {
   const label = typeof body.label === "string" ? ledgerText(body.label, STEP_LABEL_MAX) : "";
   const sentence = typeof body.sentence === "string" ? ledgerText(body.sentence, STEP_SENTENCE_MAX) : "";
   const answer = typeof body.answer === "string" ? ledgerText(body.answer, ANSWER_MAX) : "";
-  if ((kind === "step" || kind === "approval") && !label) return problem(400, "bad_request", { field: "label" });
-  if (kind === "approval" && !sentence) return problem(400, "bad_request", { field: "sentence" });
+  if ((kind === "step" || kind === "approval" || kind === "turn") && !label) return problem(400, "bad_request", { field: "label" });
+  if ((kind === "approval" || kind === "turn") && !sentence) return problem(400, "bad_request", { field: "sentence" });
   if (kind === "finish" && !answer) return problem(400, "bad_request", { field: "answer" });
   if (kind === "end" && !BROWSER_END_REASONS[body.reason]) return problem(400, "bad_request", { field: "reason" });
 
@@ -1600,7 +1600,8 @@ async function stepTask(request, env) {
   const entry = {
     name: `step-${n}`, kind, ended: Date.now(), outcome: "ok",
     ...(label ? { label } : {}),
-    ...(kind === "approval" ? { ask: sentence } : {}),
+    // A TURN (A94) is asked in a task of either mode: it unlocks nothing.
+    ...(kind === "approval" || kind === "turn" ? { ask: sentence } : {}),
     ...(kind === "finish" ? { answer, label: label || "Done" } : {}),
   };
   try {
