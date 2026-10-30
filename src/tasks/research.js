@@ -50,9 +50,10 @@ write-up in Markdown: the answer first, then what supports it, then the sources 
 No prose outside the JSON.`;
 
 export async function runResearch(ctx) {
-  const { request, context } = ctx.task.input;
+  const { request } = ctx.task.input;
   const model = ctx.entry.model;
-  const question = context ? `${request}\n(Asked while looking at: ${context})` : request;
+  // The request stands on its own (A93): no window line rides beside it.
+  const question = request;
 
   const plan = await ctx.step("plan", async () => {
     const reply = await ctx.model({

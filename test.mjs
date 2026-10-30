@@ -1471,7 +1471,9 @@ console.log("tasks (A82): a row, a Workflow, a header — never the question pat
     check("a good create answers the id and `created`", r1.status === 200 && typeof j1.id === "string" && j1.state === "created", JSON.stringify(j1));
     check("the row holds exactly the input fields, the title and the task version",
           row && row.state === "created" && JSON.stringify(Object.keys(JSON.parse(row.input)).sort())
-            === JSON.stringify(["context", "now", "request", "taskVersion", "title", "tz"]) && JSON.parse(row.input).taskVersion === TASK_VERSION);
+            === JSON.stringify(["now", "request", "taskVersion", "title", "tz"]) && JSON.parse(row.input).taskVersion === TASK_VERSION);
+    check("an older Otto's window line is accepted and not stored (A93)",
+          r1.status === 200 && !row.input.includes("Brain.swift"));
     check("a create without a title is named by its request, cut at a word boundary (A91)",
           JSON.parse(row.input).title === "How do Swift actors handle reentrancy…", JSON.parse(row.input).title);
     clearCounter();
