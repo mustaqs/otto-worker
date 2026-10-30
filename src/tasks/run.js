@@ -16,7 +16,7 @@
  *   - the ledger write is best-effort: a step whose work is done is never
  *     failed or retried because the bookkeeping failed.
  *
- * What is never logged: the request, the context, the document, a prompt, a
+ * What is never logged: the request, the document, a prompt, a
  * finding, the draft, the result, the question. Lines carry the type, the
  * state, the reason word, a step name and an error class.
  */

@@ -23,7 +23,7 @@ import {
 // summaryQuery, the one read checkLimits batches with its counters (from D1
 // since 2026-10-29) — Bench/check-task-path.sh.
 import {
-  TYPES, TASK_VERSION, CREATE_KEYS, REQUEST_MAX_CHARS, CONTEXT_MAX_CHARS, DOCUMENT_MAX_BYTES,
+  TYPES, TASK_VERSION, CREATE_KEYS, REQUEST_MAX_CHARS, DOCUMENT_MAX_BYTES,
   BROWSER_MODES, URL_MAX_CHARS, BROWSER_MAX_STEPS, BROWSER_MAX_CALLS, SPOKEN_MAX_CHARS,
 } from "./tasks/registry.js";
 import {
@@ -1394,7 +1394,7 @@ async function integrationsWebhook(request, env) {
  * is refused with `needs_account` before anything is read. Every row read
  * names the account, so another account's id is `not_found`.
  *
- * WHAT IS NEVER LOGGED: the request, the context, the document, the
+ * WHAT IS NEVER LOGGED: the request, the document, the
  * question, the result. Lines carry a type, a state, a reason word.
  */
 
@@ -1407,10 +1407,10 @@ async function safeTasksHeader(env, accountId) {
 }
 
 /**
- * POST /v1/tasks/create  { type, request, context?, document?, now, tz }  →  200 { id, state: "created" } + otto-tasks
+ * POST /v1/tasks/create  { type, request, title?, document?, now, tz }  →  200 { id, state: "created" } + otto-tasks
  *
  * In order: the bearer must have an account; the body must carry only the
- * six allowed keys — an allowlist, so an image never arrives under a name of
+ * keys in CREATE_KEYS — an allowlist, so an image never arrives under a name of
  * its own (A60); the type must be in the registry and the request bounded;
  * the document only for a type that declares it; the task counter under the
  * plan's cap, counted BEFORE the create so a create that fails still counts;
@@ -1452,7 +1452,8 @@ async function createTask(request, env) {
   } else if (body.mode !== undefined || body.url !== undefined) {
     return problem(400, "bad_request", { field: body.mode !== undefined ? "mode" : "url" });
   }
-  const context = typeof body.context === "string" ? body.context.trim().slice(0, CONTEXT_MAX_CHARS) : "";
+  // NO WINDOW LINE (A93): an older Otto's `context` is accepted and dropped
+  // here. The request is the model's, written to stand on its own.
   const now = typeof body.now === "string" && !Number.isNaN(new Date(body.now).getTime()) ? body.now : null;
   if (!now) return problem(400, "bad_request", { field: "now" });
   const tz = typeof body.tz === "string" && body.tz ? body.tz.slice(0, 64) : "UTC";
@@ -1483,7 +1484,7 @@ async function createTask(request, env) {
 
   const id = crypto.randomUUID();
   const createdAt = Date.now();
-  const input = { request: text, title, ...(browser || {}), ...(context ? { context } : {}), ...(document !== undefined ? { document } : {}), now, tz, taskVersion: TASK_VERSION };
+  const input = { request: text, title, ...(browser || {}), ...(document !== undefined ? { document } : {}), now, tz, taskVersion: TASK_VERSION };
   try {
     await insertRow(env, { id, accountId, type, input, createdAt });
   } catch (error) {

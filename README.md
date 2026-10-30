@@ -224,7 +224,7 @@ relay as a Cloudflare Workflow and is delivered on the user's next question or
 panel open. Nine routes, none of them the question path; every reply but
 `ask`'s carries `otto-tasks`:
 
-    POST /v1/tasks/create   { type, request, context?, document?, now, tz } → 200 { id, state: "created" }
+    POST /v1/tasks/create   { type, request, title?, document?, now, tz } → 200 { id, state: "created" }
     POST /v1/tasks/approve  { id, decision: "approve" | "decline" }        → 200 { id, state }
     POST /v1/tasks/cancel   { id }                                           → 200 { id, state: "cancelled" }
     POST /v1/tasks/take     { id }                                           → 200 { id, type, state, reason?, result?, steps }
