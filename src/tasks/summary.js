@@ -43,11 +43,17 @@ export const BROWSER_END_REASONS = {
   extension_missing: "Stopped — the Chrome profile Otto uses isn't open, or Otto's extension is off in it.",
   gave_up: "Stopped — I couldn't do that on this site.",
 };
+/** A turn's two endings (A94), set by the run, never posted by the Mac. */
+const TURN_ENDS = {
+  stopped: "Stopped — you pressed Stop.",
+  turn_timeout: "Stopped — I waited fifteen minutes for your turn.",
+};
 function browserEnded(state, reason, host) {
   // THE CHECKPOINT NAMES THE SITE (A89): "news.example.com wants to check
   // you're human — the tab is yours." The host is the start page's, from the row.
   if (reason === "checkpoint" && host) return `${host} wants to check you're human — the tab is yours.`;
   if (BROWSER_END_REASONS[reason]) return BROWSER_END_REASONS[reason];
+  if (TURN_ENDS[reason]) return TURN_ENDS[reason];
   if (state === "expired" && reason === "idle") return "Your Mac went to sleep or Otto quit, so I stopped.";
   if (state === "cancelled" && reason === "declined") return "Stopped — you said no.";
   if (state === "cancelled") return "The browser task was cancelled.";

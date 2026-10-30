@@ -74,6 +74,9 @@ export const TYPES = {
     // The Mac's loop waits on the answer with the window open, so the hold
     // is as long as the idle limit, not a research task's day.
     approvalTimeout: "10 minutes",
+    // A TURN (A94): signing in, a code from a phone, a check — longer than a
+    // yes, and separate from the ten minutes with no step.
+    turnTimeout: "15 minutes",
     idleTimeout: "10 minutes",
     maxDurationMs: 30 * 60 * 1000,
     maxSteps: BROWSER_MAX_STEPS,
